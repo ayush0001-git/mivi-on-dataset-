@@ -1,0 +1,170 @@
+[
+  {
+    "id": "eng-budget-cutoff",
+    "question": "My marks are 78% in Class 12 and my family can spend Rs 1.5 lakh per year. Which engineering colleges am I eligible for?",
+    "expect": {
+      "answered": true,
+      "must_cite": ["C003", "C009"],
+      "must_not_cite": ["C001", "C012", "C006"]
+    },
+    "note": "Cutoff is a hard floor: C001 (82%) and C012 (88%) must be excluded at 78%. C003 and C009 pass both fee and cutoff."
+  },
+  {
+    "id": "mba-cost",
+    "question": "What MBA options are there and what are the fees?",
+    "expect": {
+      "answered": true,
+      "must_cite": ["C002", "C004"],
+      "must_not_cite": ["C014"],
+      "answer_any": ["98,000", "98000"]
+    },
+    "note": "Similar-name trap: Ganga Institute of Commerce (C014) has no MBA and must not be confused with Ganga Valley University (C002)."
+  },
+  {
+    "id": "gov-hostel",
+    "question": "List the government colleges that have hostel facilities.",
+    "expect": {
+      "answered": true,
+      "must_cite": ["C007", "C012"],
+      "must_not_cite": ["C005", "C011"]
+    },
+    "note": "C005 and C011 are government but have no hostel."
+  },
+  {
+    "id": "phd-refusal",
+    "question": "Does Ganga Valley University offer a PhD in Physics?",
+    "expect": {
+      "answered": false
+    },
+    "note": "Not in the data; the system must say so rather than guess. (Doctoral scholars exist only at C009, engineering only.)"
+  },
+  {
+    "id": "per-semester-units",
+    "question": "I can pay 60 thousand rupees per semester. Which colleges fit my budget?",
+    "expect": {
+      "answered": true,
+      "must_cite": ["C002", "C009", "C012"],
+      "must_not_cite": ["C001", "C003", "C006", "C008"],
+      "answer_any": ["semester"]
+    },
+    "note": "Unit trap: 60k/semester = 1.2 lakh/year (2 semesters/year, assumption must be stated). C001 (1.45L) and C003 (1.32L) exceed it."
+  },
+  {
+    "id": "scholarship-lowincome",
+    "question": "Which colleges offer scholarships or fee concessions for students from low-income families?",
+    "expect": {
+      "answered": true,
+      "must_cite": ["C002", "C005", "C007", "C012"]
+    },
+    "note": "Answerable only from the free-text 'about' field. C004 (need-based alumni scholarship) is acceptable extra."
+  },
+  {
+    "id": "c006-placement-guard",
+    "question": "Which college has the lowest average placement package?",
+    "expect": {
+      "answered": true,
+      "must_cite": ["C007"],
+      "special": "c006_guard"
+    },
+    "note": "C006 reports 0 = not reported (medical college), NOT worst. Lowest reported figure is C007 at 2.8 LPA."
+  },
+  {
+    "id": "hindi-multilang",
+    "question": "किन सरकारी कॉलेजों में हॉस्टल की सुविधा उपलब्ध है?",
+    "expect": {
+      "answered": true,
+      "must_cite": ["C007", "C012"],
+      "answer_devanagari": true
+    },
+    "note": "Multilingual check: Hindi question must retrieve correctly and be answered in Hindi."
+  },
+  {
+    "id": "missing-field-refusal",
+    "question": "What is the student-to-faculty ratio at Terai Technical University?",
+    "expect": {
+      "answered": false
+    },
+    "note": "The dataset has no such field for C009; the system must refuse gracefully instead of inventing a number."
+  },
+  {
+    "id": "diploma-judgment",
+    "question": "Can I study engineering somewhere for under Rs 50,000 a year? I scored 65%.",
+    "expect": {
+      "answered": true,
+      "must_cite": ["C005"],
+      "answer_any": ["diploma"]
+    },
+    "note": "Only C005 fits fee+cutoff, but it awards diplomas, not degrees — the answer must disclose that explicitly. (C012 fits the fee but its 88% cutoff excludes a 65% student.)"
+  },
+  {
+    "id": "full-profile-lookup",
+    "question": "Give me all the details about Kumaon Arts and Science College, Almora — hostel available, allocated prioritizing students from remote hill blocks.",
+    "expect": {
+      "answered": true,
+      "must_cite": ["C007"],
+      "answer_any": ["15,000", "15000"]
+    },
+    "note": "Regression for a real bug: 'hiLL Blocks' used to substring-match the 'LLB' course token, tripping the course check into a false refusal. Full-profile lookups must return the whole record."
+  },
+  {
+    "id": "total-course-budget",
+    "question": "My family can spend 4 lakh in total for the whole course. Which B.Tech colleges fit?",
+    "expect": {
+      "answered": true,
+      "answer_any": ["year", "साल"],
+      "must_not_cite": ["C006", "C008"]
+    },
+    "note": "Third unit style from the data dictionary: a TOTAL-course budget must not be silently treated as an annual ceiling — the answer must reason per-year (a 4-year B.Tech at 4L total means ~1L/year) and state the framing."
+  },
+
+  {
+    "id": "adv-multi-condition-superlative",
+    "tier": "adversarial",
+    "question": "Which college has the highest placement AND also has a hostel?",
+    "expect": {
+      "answered": true,
+      "must_cite": ["C012"]
+    },
+    "note": "ADVERSARIAL: two conditions plus a superlative. C012 (8.4 LPA, hostel Yes) is the answer; requires combining a max with a boolean filter, which top-k + a single superlative fact doesn't directly hand the model."
+  },
+  {
+    "id": "adv-implicit-constraints",
+    "tier": "adversarial",
+    "question": "I'm a girl from a hill district and money is tight. What are my best options?",
+    "expect": {
+      "answered": true,
+      "must_cite_any": ["C003", "C007", "C013"]
+    },
+    "note": "ADVERSARIAL: three soft constraints, all in free text — female concession (C003), hill-district scholarship (C013), low-fee government (C007). No structured field captures 'girl' or 'hill district'; success depends entirely on about-field retrieval. Known weak spot."
+  },
+  {
+    "id": "adv-gov-no-hostel",
+    "tier": "adversarial",
+    "question": "List the government colleges that do NOT have a hostel.",
+    "expect": {
+      "answered": true,
+      "must_cite": ["C005", "C011"],
+      "must_not_cite": ["C007", "C012"]
+    },
+    "note": "ADVERSARIAL: negation combined with a type filter. Only C005 and C011 are government AND hostel=No. Tests that negation handling and the government filter compose correctly."
+  },
+  {
+    "id": "adv-subjective-tradeoff",
+    "tier": "adversarial",
+    "question": "Between the cheapest engineering college and the one with the best placement, which is the smarter choice?",
+    "expect": {
+      "answered": true,
+      "must_cite_any": ["C005", "C012"]
+    },
+    "note": "ADVERSARIAL: subjective value judgement with no single right answer. A good response lays out the trade-off (C005 cheapest but diploma-only; C012 best placement, higher cutoff) rather than declaring a winner. Graded loosely; here to observe behaviour, not to guarantee a pass."
+  },
+  {
+    "id": "adv-missing-metric-refusal",
+    "tier": "adversarial",
+    "question": "Which college has the best NIRF ranking?",
+    "expect": {
+      "answered": false
+    },
+    "note": "ADVERSARIAL refusal: NIRF rank is not a field we hold. Must refuse gracefully, not substitute NAAC grade or placement as if it were a ranking."
+  }
+]

@@ -1,0 +1,263 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>mimi.ai (beta)</title>
+<style>
+  :root{
+    --bg:#f4f6fb; --card:#ffffff; --ink:#1c2333; --muted:#68718a;
+    --brand:#c8102e; --brand-dark:#9c0c24; --bot:#eef1f8; --user:#c8102e;
+    --chip:#e6ebf5; --chip-ink:#33405e; --ok:#0d7a43; --warn:#b45309;
+    --web:#1d4ed8; --web-bg:#eaf0ff;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;font-family:"Segoe UI",system-ui,sans-serif;background:var(--bg);color:var(--ink);
+       display:flex;flex-direction:column;height:100vh}
+  header{background:var(--card);border-bottom:1px solid #e3e7f0;padding:14px 22px;
+         display:flex;align-items:center;gap:12px}
+  .logo{width:38px;height:38px;border-radius:10px;background:var(--brand);color:#fff;
+        display:flex;align-items:center;justify-content:center;font-weight:700;font-size:18px}
+  header h1{font-size:16px;margin:0}
+  header .sub{font-size:12px;color:var(--muted)}
+  #chat{flex:1;overflow-y:auto;padding:22px;max-width:860px;width:100%;margin:0 auto;
+        display:flex;flex-direction:column;gap:14px}
+  .msg{max-width:78%;padding:12px 15px;border-radius:14px;line-height:1.55;font-size:14.5px;
+       white-space:pre-wrap;word-wrap:break-word}
+  .user{align-self:flex-end;background:var(--user);color:#fff;border-bottom-right-radius:4px}
+  .bot{align-self:flex-start;background:var(--bot);border-bottom-left-radius:4px}
+  .meta{align-self:flex-start;max-width:78%;display:flex;flex-wrap:wrap;gap:5px;align-items:center;
+        margin-top:-6px;padding-left:2px}
+  .chip{background:transparent;color:var(--muted);border-radius:999px;padding:2px 8px 2px 0;
+        font-size:11px;font-weight:500;position:relative}
+  .chip:not(:last-of-type)::after{content:"·";margin-left:8px;color:#c7cede}
+  .chip.url{max-width:220px;overflow:hidden;text-overflow:ellipsis;white-space:nowrap;display:inline-block}
+  .src{font-size:11px;color:#a7afc2;font-weight:500}
+  .typing{align-self:flex-start;color:var(--muted);font-size:13px;padding:6px 2px}
+  #reset{margin-left:auto;border:1.5px solid #d4dae8;background:#fff;color:var(--muted);
+         border-radius:999px;padding:6px 14px;font-size:12.5px;font-weight:600;cursor:pointer}
+  #reset:hover{border-color:var(--brand);color:var(--brand)}
+  #examples{display:flex;flex-wrap:wrap;gap:8px;align-self:flex-start;max-width:78%}
+  .exchip{border:1.5px solid #d4dae8;background:#fff;color:var(--chip-ink);border-radius:999px;
+          padding:7px 14px;font-size:12.5px;font-weight:600;cursor:pointer}
+  .exchip:hover{border-color:var(--brand);color:var(--brand)}
+  .copybtn{border:0;background:none;cursor:pointer;font-size:13px;opacity:.45;padding:2px 4px}
+  .copybtn:hover{opacity:1}
+  .msg table.cmp{border-collapse:collapse;margin:8px 0;width:100%;font-size:13px;background:#fff;border-radius:8px;display:block;overflow-x:auto;max-width:100%}
+  .msg table.cmp th,.msg table.cmp td{border:1px solid #d4dae8;padding:7px 10px;text-align:left;white-space:normal}
+  .msg table.cmp th{background:var(--chip);font-weight:700;color:var(--chip-ink)}
+  footer{background:var(--card);border-top:1px solid #e3e7f0;padding:14px 22px}
+  .inputrow{max-width:860px;margin:0 auto;display:flex;gap:10px}
+  #q{flex:1;border:1.5px solid #d4dae8;border-radius:12px;padding:12px 14px;font-size:14.5px;
+     outline:none;font-family:inherit}
+  #q:focus{border-color:var(--brand)}
+  #send{background:var(--brand);color:#fff;border:0;border-radius:12px;padding:0 22px;
+        font-size:14.5px;font-weight:600;cursor:pointer}
+  #send:hover{background:var(--brand-dark)} #send:disabled{opacity:.5;cursor:default}
+  #webtoggle{border:1.5px solid #d4dae8;background:#fff;color:var(--muted);border-radius:12px;
+             padding:0 14px;font-size:12.5px;font-weight:600;cursor:pointer;white-space:nowrap}
+  #webtoggle.on{border-color:var(--web);color:var(--web);background:var(--web-bg)}
+  a.chip{color:var(--web);text-decoration:none}
+  a.chip:hover{text-decoration:underline}
+  .webtag{background:var(--web-bg);color:var(--web);border-radius:999px;padding:2px 9px;
+          font-size:11px;font-weight:600}
+  .hint{max-width:860px;margin:8px auto 0;font-size:11.5px;color:var(--muted);text-align:center}
+</style>
+</head>
+<body>
+<header>
+  <div class="logo">M</div>
+  <div>
+    <h1>mimi.ai <span style="color:var(--muted);font-weight:400">(beta)</span></h1>
+  </div>
+  <button id="reset" title="Clear the conversation">↻ Start over</button>
+</header>
+
+<div id="chat">
+  <div class="msg bot">Hello! 👋 I'm mimi, your personal MME college counsellor — let's find your perfect college, step by step. To begin: how much did you score in Class 12 (%)?</div>
+  <div id="examples">
+    <button class="exchip">Which colleges offer an MBA?</button>
+    <button class="exchip">Best engineering college under ₹1.5 lakh/year</button>
+    <button class="exchip">Scholarships for low-income families</button>
+    <button class="exchip">सबसे सस्ता कॉलेज कौन सा है?</button>
+  </div>
+</div>
+
+<footer>
+  <div class="inputrow">
+    <input id="q" placeholder="e.g. Which colleges offer an MBA, and what do they cost?" autocomplete="off">
+    <button id="webtoggle" title="Experimental: answer from the live web via Firecrawl. Results cite URLs and are UNVERIFIED — the normal mode answers only from the verified dataset.">🌐 Web: off</button>
+    <button id="send">Send</button>
+  </div>
+  <div class="hint">Every answer is grounded in the verified dataset (C001–C015) and cites its source records. The 🌐 toggle switches to an experimental live-web mode (unverified, URL citations).</div>
+</footer>
+
+<script>
+const chat = document.getElementById("chat");
+const q = document.getElementById("q");
+const send = document.getElementById("send");
+
+function el(tag, cls, text){ const e = document.createElement(tag); if(cls) e.className = cls; if(text !== undefined) e.textContent = text; return e; }
+function scroll(){ chat.scrollTop = chat.scrollHeight; }
+
+function addUser(text){ chat.appendChild(el("div","msg user",text)); scroll(); }
+
+// Works from http://localhost:8000 AND when the file is opened directly.
+const BASE = location.protocol === "file:" ? "http://localhost:8000" : "";
+const API = BASE + "/api/answer";
+// Conversation memory: the counsellor sees the recent turns of THIS chat.
+const chatHistory = [];
+// Running student profile — survives the whole session even once older
+// turns scroll out of the (last-6) history window sent to the server.
+let studentProfile = {};
+// id -> "College Name, City" so citations read like colleges, not codes.
+let COLLEGES = {};
+fetch(BASE + "/api/colleges").then(r => r.json()).then(m => { COLLEGES = m; }).catch(() => {});
+
+function renderAnswer(container, text){
+  const lines = (text || "(no answer)").split("\n");
+  let i = 0;
+  while (i < lines.length){
+    if (lines[i].trim().startsWith("|")){
+      const table = el("table","cmp");
+      let first = true;
+      while (i < lines.length && lines[i].trim().startsWith("|")){
+        const rl = lines[i].trim();
+        i++;
+        if (/^\|[\s\-:|]+\|$/.test(rl)) continue;   // markdown separator row
+        const cells = rl.split("|").map(s => s.trim());
+        if (cells[0] === "") cells.shift();
+        if (cells[cells.length-1] === "") cells.pop();
+        const tr = document.createElement("tr");
+        cells.forEach(c => { const cell = document.createElement(first ? "th" : "td");
+                             cell.textContent = c; tr.appendChild(cell); });
+        table.appendChild(tr);
+        first = false;
+      }
+      container.appendChild(table);
+    } else {
+      container.appendChild(el("div", "", lines[i]));
+      i++;
+    }
+  }
+}
+
+function addBot(result, isWeb, question){
+  const m = el("div", "msg bot");
+  renderAnswer(m, result.answer);
+  chat.appendChild(m);
+  // Citations still travel in the JSON — they are the graded contract and are
+  // verified in code before an answer ships. They're simply not printed under
+  // every bubble: a 15-college source list buries the advice it's meant to
+  // support. Web results keep their label, because "unverified" isn't cosmetic.
+  const meta = el("div","meta");
+  if (isWeb){
+    meta.appendChild(el("span","webtag","🌐 web result — unverified"));
+    (result.citations || []).forEach(c => {
+      if (/^https?:\/\//.test(c)){
+        const a = el("a","chip url", c.replace(/^https?:\/\/(www\.)?/,""));
+        a.href = c; a.target = "_blank"; a.rel = "noopener"; a.title = c;
+        meta.appendChild(a);
+      }
+    });
+  }
+  const copy = el("button","copybtn","📋");
+  copy.title = "Copy answer";
+  copy.onclick = () => navigator.clipboard.writeText(result.answer || "");
+  meta.appendChild(copy);
+  chat.appendChild(meta);
+  scroll();
+}
+
+async function ask(question, mode, prefs){
+  const t = el("div","typing", mode === "web" ? "Searching the live web (Firecrawl)…" : "Reading your question…");
+  chat.appendChild(t); scroll();
+  // Progressive status: the answer is verified before it ships, so we can't
+  // stream tokens — but showing the real stages keeps the wait honest and
+  // makes it feel far shorter than one static "Thinking…".
+  let stageTimer = null;
+  if (mode !== "web"){
+    const stages = ["Reading your question…", "Looking through the colleges…",
+                    "Checking every number…", "Writing your answer…"];
+    let i = 0;
+    stageTimer = setInterval(() => {
+      i = Math.min(i + 1, stages.length - 1);
+      t.textContent = stages[i];
+    }, 1200);
+  }
+  try{
+    const r = await fetch(API, {
+      method:"POST", headers:{"Content-Type":"application/json"},
+      body: JSON.stringify({question, mode, prefs: prefs || null,
+                            history: chatHistory.slice(-6),
+                            known_profile: studentProfile})
+    });
+    const data = await r.json();
+    if (data.profile) studentProfile = data.profile;   // grows, never resets mid-session
+    if (stageTimer) clearInterval(stageTimer);
+    t.remove();
+    addBot(data, mode === "web", question);
+    if (mode !== "web"){
+      chatHistory.push({role:"user", content: question},
+                       {role:"assistant", content: data.answer || ""});
+    }
+  }catch(e){
+    if (stageTimer) clearInterval(stageTimer);
+    t.remove();
+    addBot({answer:"Could not reach the server. Start it with:\n  uvicorn app:app --port 8000\nthen open http://localhost:8000 in your browser.", citations:[], answered:false}, false, question);
+  }
+}
+
+// Example chips: click to ask.
+document.querySelectorAll(".exchip").forEach(b => {
+  b.onclick = () => { q.value = b.textContent; submit(); };
+});
+
+// Start over: clear the conversation and the counsellor's memory of it.
+document.getElementById("reset").onclick = () => {
+  chatHistory.length = 0;
+  studentProfile = {};
+  const keep = chat.children[0];          // the greeting
+  const chips = document.getElementById("examples");
+  chat.innerHTML = "";
+  chat.appendChild(keep);
+  if (chips){ chips.style.display = ""; chat.appendChild(chips); }
+  q.value = ""; q.focus();
+};
+
+// Experimental live-web mode (Firecrawl). Off by default; the toggle makes
+// the choice explicit and visible, and web answers never enter chat history.
+let webMode = false;
+const webtoggle = document.getElementById("webtoggle");
+webtoggle.onclick = () => {
+  webMode = !webMode;
+  webtoggle.classList.toggle("on", webMode);
+  webtoggle.textContent = webMode ? "🌐 Web: on" : "🌐 Web: off";
+};
+
+async function submit(){
+  if (send.disabled) return;              // Enter must not double-fire mid-request
+  const text = q.value.trim();
+  if(!text) return;
+  const ex = document.getElementById("examples");
+  if (ex) ex.style.display = "none";
+  q.value = ""; send.disabled = true;
+  addUser(text);
+  if (webMode){
+    // Fold the student's known profile into the web search preferences.
+    const prefs = {
+      course:   String(studentProfile.field_interest || ""),
+      budget:   String(studentProfile.budget || ""),
+      location: String(studentProfile.location || "")
+    };
+    await ask(text, "web", prefs);
+  } else {
+    await ask(text, "db");
+  }
+  send.disabled = false; q.focus();
+}
+send.onclick = submit;
+q.addEventListener("keydown", e => { if(e.key === "Enter" && !e.isComposing) submit(); });
+</script>
+</body>
+</html>

@@ -1,0 +1,13 @@
+# Core pipeline (answer.py / run_all.py / evals)
+sentence-transformers>=2.7
+numpy>=1.26
+openai>=1.30
+python-dotenv>=1.0
+
+# Optional demo UI (uvicorn app:app --port 8000)
+fastapi>=0.110
+uvicorn>=0.29
+pydantic>=2.6
+
+# Optional web mode (rag_core/webmode.py, demo UI only)
+requests>=2.31
