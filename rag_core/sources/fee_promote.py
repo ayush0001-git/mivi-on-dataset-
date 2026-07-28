@@ -121,8 +121,21 @@ def _pick_tuition(payload) -> tuple[int, str, str] | None:
     for label, raw in payload.items():
         if not _TUITION_LABEL.search(str(label)) or _NOT_TUITION.search(str(label)):
             continue
+        # The VALUE must be disqualified too, not just the key. _amount() takes
+        # the first rupee figure anywhere in the string, so a key reading
+        # "Tuition Fee" whose value reads "Rs 500 (hostel) Rs 90,000" would have
+        # promoted the hostel charge as tuition. Extractors flatten a whole table
+        # row into the value often enough that the key alone is not the label for
+        # the number that gets picked.
+        if _NOT_TUITION.search(str(raw)):
+            continue
         amt = _amount(raw)
         if amt is None:
+            continue
+        # A value holding several rupee figures is a flattened row, and there is
+        # no way to know which one the key names. Refuse rather than take the
+        # first: this is a fee a student would plan around.
+        if len(_RUPEES.findall(str(raw))) > 1:
             continue
         period = _period(str(label), str(raw))
         # Lowest qualifying tuition wins. Fee tables list the general category

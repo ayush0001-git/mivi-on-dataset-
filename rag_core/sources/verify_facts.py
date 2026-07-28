@@ -466,10 +466,23 @@ _AY_RE = re.compile(
     r"\b(20[0-4]\d)\s*[-/–]\s*(\d{2}|20[0-4]\d)\b", re.I)
 # A bare year, only when a fee/admission word vouches for it. "2019" alone on a
 # page is as likely to be a copyright footer or an establishment year.
+#
+# \b on every vouching word is load-bearing: unanchored, "fee" matched inside
+# "Feedback", which appears in the footer of nearly every Indian college site, so
+# any stray year on the page could vouch for itself.
 _BARE_YEAR_RE = re.compile(
-    r"(?:fee|fees|tuition|charges|admission|session|academic)[^.\n]{0,40}?"
+    r"\b(?:fees?|tuition|charges|admissions?|session|academic)\b[^.\n]{0,40}?"
     r"\b(20[0-4]\d)\b|\b(20[0-4]\d)\b[^.\n]{0,20}?"
-    r"(?:fee\s*structure|fees|tuition)", re.I)
+    r"\b(?:fee\s*structure|fees?|tuition)\b", re.I)
+
+# Words that make a year the year OF THE FIGURES rather than just a year on the
+# page. An academic-year token can appear anywhere — a news item, an affiliation
+# notice, next year's prospectus link — and taking the maximum across 60k
+# characters attributed the newest of those to the fees.
+_NEAR_FEE = re.compile(
+    r"\b(fees?|tuition|charges|fee\s*structure|admissions?|session|academic"
+    r"|scholarship|cut\s*off|hostel|semester|annual)\b", re.I)
+NEAR_WINDOW = 220        # characters either side of the year token
 
 
 def stated_year(text: str, *, now_year: int | None = None) -> str | None:
@@ -492,13 +505,22 @@ def stated_year(text: str, *, now_year: int | None = None) -> str | None:
     cap = (now_year or datetime.now(timezone.utc).year) + 1
     best: tuple[int, str] | None = None
 
-    for m in _AY_RE.finditer(text[:60_000]):
+    window = text[:60_000]
+    for m in _AY_RE.finditer(window):
         start = int(m.group(1))
         tail = m.group(2)
         end = int(tail) if len(tail) == 4 else int(str(start)[:2] + tail)
         # An academic year spans one or two calendar years, never more: "2015-30"
         # is a validity range or a phone number, not a session.
         if not 2000 <= start <= cap or end - start not in (0, 1):
+            continue
+        # The year has to be NEAR something it could be the year of. Without
+        # this, the maximum year anywhere on the page won — a news item, an
+        # affiliation notice, or a link to next year's prospectus would re-date
+        # a fee table published years earlier, which is the exact staleness this
+        # function exists to expose.
+        around = window[max(0, m.start() - NEAR_WINDOW):m.end() + NEAR_WINDOW]
+        if not _NEAR_FEE.search(around):
             continue
         label = f"{start}-{str(end)[-2:]}"
         if best is None or start > best[0]:

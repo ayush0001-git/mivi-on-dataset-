@@ -107,6 +107,81 @@ def _fee_phrase(lo, hi, is_abroad: bool) -> str:
             f"as an annual fee).")
 
 
+# ---------------------------------------------------------------------------
+# Is this token an entrance exam, a school board, or neither?
+#
+# Lives here rather than in sources/ because BOTH the catalogue renderer below
+# and sources/admission_ingest.py need the same answer, and sources already
+# depends on store (never the other way round).
+#
+# It is needed because the catalogue's `entrance_exams` field is mislabelled at
+# source. Measured over 95,048 tokens across 29,951 colleges, its most common
+# values are CBSE 12th (20,760), ISC (20,219), UP 12th, Karnataka 2nd PUC, GSEB
+# HSC and ICSE — school boards, not exams. Rendering them under "Entrance exams
+# accepted" told a student their own board was an entrance exam, which is the
+# opposite of useful when they are asking which exam to sit.
+# ---------------------------------------------------------------------------
+
+_BOARD_HINT = re.compile(
+    r"\b(cbse|icse|isc|nios|hsc|puc|hsslc|ahsec|wbchse|bseb|rbse|hbse|cgbse"
+    r"|mpbse|upmsp|pseb|gseb|kseeb|tnbse|bieap|tsbie|jkbose|cisce"
+    r"|hssc|chse|bse\b|dge|pue|mbose|nbse"
+    r"|board|10th|12th|xii|matric|intermediate|senior\s*secondary"
+    r"|higher\s*secondary|state\s*board|equivalent|diploma|graduation"
+    r"|bachelor|degree)\b", re.I)
+
+_EXAM_NAMES = re.compile(
+    r"\b(jee|neet|gate|cat|mat|xat|cmat|cuet|clat|nift|nata|bitsat|viteee"
+    r"|srmjeee|comedk|kcet|eamcet|emcet|cet|wbjee|kiitee|net|gpat|ielts"
+    r"|toefl|pte|duolingo|gmat|gre|sat|nmat|snap|iift|tissnet|ugat|aiapget"
+    r"|inicet|jexpo|reap|ubter|jeep|jenpas|hpcet|dcece|atma|bcece|gujcet"
+    r"|hstes|uptac|aieea)\b", re.I)
+_EXAM_WORDS = re.compile(
+    r"entrance|counsell?ing|admission\s*(test|process)|selection\s*test"
+    r"|\bexams?\b|\btest\b", re.I)
+_EXAM_ACRONYM = re.compile(r"^[A-Z]{3,8}(\s+[A-Z]{2,8})?$")
+
+# Placeholders and column headers the source DB emits. Matched by CONTAINMENT
+# for the placeholder family, because it appears as "Course Common", "Course Name
+# Common" and inside longer strings — an exact-match rule let every variant but
+# one through, and the placeholder reached students as an accepted exam.
+_JUNK_CONTAINS = re.compile(r"courses?(\s+name)?\s*common|common\s+course", re.I)
+_JUNK_EXACT = re.compile(
+    r"^(common|others?|n\.?a\.?|none|nil|any|all|test|default|tbd|xxx+|-+|\.+"
+    r"|merit[\s-]?based|merit|direct|management\s*quota|lateral"
+    r"|courses?(\s+name)?|marks?|percentage|interview"
+    r"|[\d\s.,%/-]+)$", re.I)
+
+
+def token_is_junk(token: str) -> bool:
+    t = " ".join(str(token or "").split())
+    return not t or bool(_JUNK_EXACT.match(t) or _JUNK_CONTAINS.search(t))
+
+
+def split_exams_and_boards(tokens) -> tuple[list[str], list[str]]:
+    """(exams, boards) from one mixed list, junk discarded.
+
+    Boards are tested BEFORE the acronym rule, so WBCHSE and AHSEC stay boards
+    rather than being read as exam acronyms. A token matching neither is dropped:
+    an unrecognised value is not evidence of anything, and a wrong label on a
+    real-looking value is worse than leaving it out.
+    """
+    exams: list[str] = []
+    boards: list[str] = []
+    for raw in (tokens or []):
+        t = " ".join(str(raw or "").split())
+        if not (2 <= len(t) <= 60) or token_is_junk(t):
+            continue
+        if _EXAM_NAMES.search(t):
+            exams.append(t)
+        elif _BOARD_HINT.search(t):
+            boards.append(t)
+        elif _EXAM_WORDS.search(t) or _EXAM_ACRONYM.match(t):
+            exams.append(t)
+    # Preserve order, drop repeats.
+    return (list(dict.fromkeys(exams)), list(dict.fromkeys(boards)))
+
+
 def render_registry_lines(reg: list | None) -> list[str]:
     """NIRF rankings as citable prose.
 
@@ -287,9 +362,14 @@ def render_card(college: dict, agg: dict | None = None, facts: dict | None = Non
         h = agg.get("min_hostel_inr")
         cost = f" from {_rupees(h)} per year" if h and not is_abroad else ""
         lines.append(f"Hostel: available{cost}.")
-    exams = _loads(agg.get("entrance_exams"), [])
+    # The source field is called entrance_exams but holds boards and exams mixed
+    # together, so it is split before rendering rather than printed under one
+    # label. See split_exams_and_boards.
+    exams, boards = split_exams_and_boards(_loads(agg.get("entrance_exams"), []))
     if exams:
         lines.append(f"Entrance exams accepted: {', '.join(exams[:10])}.")
+    if boards:
+        lines.append(f"School qualifications accepted: {', '.join(boards[:10])}.")
 
     for kind, label in (("placement", "Placements"), ("scholarship", "Scholarships"),
                         ("accommodation", "Accommodation"), ("facility", "Facilities")):

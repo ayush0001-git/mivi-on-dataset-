@@ -911,6 +911,12 @@ async def enrich_one(client, pol, writer: "HarvestWriter", college: dict, fc=Non
                 if checked.verdict == "REJECTED":
                     stats["rejected"] = stats.get("rejected", 0) + 1
                     continue
+                # Dated from the PDF's own text, exactly as the HTML branch does.
+                # This branch was missing it, so every fact from a PDF or a
+                # scanned circular came out undated — and a signed fee circular
+                # is the single most likely place to find an explicit academic
+                # year, which made it the worst branch to leave out.
+                got["_stated_year"] = stated_year(text)
                 writer.fact(cid, kind, pdf_url, got)
                 stats["facts"] += 1
                 stats["pdf_facts"] = stats.get("pdf_facts", 0) + 1

@@ -190,6 +190,12 @@ GAP_DDL = (
     "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS verified_fee_label TEXT",
     "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS verified_fee_source TEXT",
     "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS verified_fee_at TIMESTAMPTZ",
+    # The academic year a harvested page states its figures are for, written by
+    # sources/web_enrich.py. college_web_facts IS declared in postgres.sql, so
+    # the clone-if-missing step below never touches it and this column would be
+    # absent from staging — which crashed a build: the existence probe found the
+    # column in `public` while the SELECT ran against the staging schema.
+    "ALTER TABLE college_web_facts ADD COLUMN IF NOT EXISTS stated_year TEXT",
 )
 
 
@@ -1107,8 +1113,15 @@ def render_cards(conn, reader) -> dict:
     with conn.cursor() as cur:
         # stated_year may not exist on a store built before it was added, and a
         # missing column must cost the harvest's dates, not the whole build.
+        #
+        # table_schema = current_schema() is load-bearing, not tidiness: without
+        # it this probe saw the column in `public` and answered yes while the
+        # SELECT below ran against the staging schema, which crashed the build
+        # after 80 seconds of staging work. A cross-schema existence check is
+        # always wrong in a two-schema build.
         cur.execute("SELECT EXISTS (SELECT 1 FROM information_schema.columns "
-                    "WHERE table_name='college_web_facts' "
+                    "WHERE table_schema = current_schema() "
+                    "AND table_name='college_web_facts' "
                     "AND column_name='stated_year') AS ok")
         has_year = bool(cur.fetchone()["ok"])
         cur.execute(

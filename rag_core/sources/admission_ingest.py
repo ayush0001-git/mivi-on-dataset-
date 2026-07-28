@@ -49,6 +49,7 @@ from collections import Counter
 from pathlib import Path
 
 from ..store.backend import get_backend
+from ..store.db import split_exams_and_boards, token_is_junk
 
 ROOT = Path(__file__).resolve().parents[2]
 DETAIL_JSONL = ROOT / "data" / "raw" / "colleges_detail.jsonl"
@@ -61,6 +62,48 @@ _BOILERPLATE = re.compile(
     r"|admission\s+guide\s+for", re.I)
 
 # "Class 12: 45.0%", "Graduation: 50%", "Class 10: 33%"
+# PAGE-SCRAPE DETECTOR.
+#
+# The source DB's eligibility field does not only contain the study-abroad nav
+# block; some rows hold a whole listing or FAQ page that a scraper flattened.
+# Those read as plausible prose, so the boilerplate, bare-number and length
+# gates all pass, and the text was stored as a per-course criterion. Measured
+# live before this gate existed: 396 rows across 48 colleges, e.g.
+#
+#   NDIM, under "Bachelor of Computer Application":
+#     "...accepts IPU CET, CUET; Graduate with 50% aggregate in any subject
+#      View course details Admission Info ... BCA Admissions 2026 1 courses"
+#     -> a PGDM rule under the BCA's name; a Class-12 student is told to be a
+#        graduate already.
+#   DPMI, on 8 courses:
+#     "...Certificate Class 10 Q: Are admissions open at DPMI? A: Yes,
+#      admissions at DPMI are currently open"
+#     -> reinstates verbatim the "admissions are open" claim this module
+#        deliberately refuses to make from admissionStatus.
+#
+# Interface furniture, not prose a college wrote about eligibility.
+_UI_MARKER = re.compile(
+    r"view\s+(?:course\s+)?details|admission\s+info\b|know\s+more"
+    r"|apply\s+now|read\s+more|click\s+here|compare\s+colleges"
+    r"|seat\s+intake\b|\bcourses?\s+eligibility\b|download\s+brochure"
+    r"|check\s+(?:fees|eligibility)|view\s+all|show\s+more"
+    r"|\d+\s+courses?\b|shortlist", re.I)
+# A flattened FAQ. "Q: ... A: ..." is never how a criterion is written.
+_FAQ = re.compile(r"\bq\s*[:.]\s*\w|\ba\s*[:.]\s*yes\b|frequently\s+asked", re.I)
+
+
+def _is_page_scrape(v: str) -> str | None:
+    """Why this value is a scraped page rather than a criterion, or None."""
+    if _FAQ.search(v):
+        return "flattened FAQ text, not a criterion"
+    hits = {m.group(0).lower() for m in _UI_MARKER.finditer(v)}
+    # One marker can appear in honest prose ("2 courses" in a sentence). Two
+    # distinct ones is interface text.
+    if len(hits) >= 2:
+        return f"scraped page furniture ({len(hits)} UI markers)"
+    return None
+
+
 _MARKS = re.compile(
     r"^(class\s*\d{1,2}|graduation|bachelor'?s?|diploma|post\s*graduation)"
     r"\s*[:\-]\s*(\d{1,3}(?:\.\d+)?)\s*%?$", re.I)
@@ -89,6 +132,16 @@ def classify(value: str) -> tuple[str | None, dict | None, str]:
         return None, None, "empty"
     if _BOILERPLATE.search(v):
         return None, None, "website navigation text"
+    scrape = _is_page_scrape(v)
+    if scrape:
+        return None, None, scrape
+    # Prose carrying the source DB's placeholder is not a criterion — it is two
+    # scraped fields run together, and the rule after the placeholder belongs to
+    # whichever programme the scraper was on. Live example: "Course Name Common
+    # Eligibility BPharm Class 12 ... DPh" was stored under Bachelor of
+    # Physiotherapy, so a BPT applicant was shown a pharmacy requirement.
+    if _JUNK_CONTAINS.search(v):
+        return None, None, "placeholder-prefixed text from a field concatenation"
 
     m = _MARKS.match(v)
     if m:
@@ -117,17 +170,23 @@ def classify(value: str) -> tuple[str | None, dict | None, str]:
 #   foreign tests      IELTS (2,148), TOEFL, PTE — abroad listings only
 # Calling IELTS an "accepted board" would be a wrong fact, and "which exams does
 # this college accept" is the more useful question anyway, so they are split.
-_EXAM_TOKENS = re.compile(
-    r"\b(jee|neet|gate|cat|mat|xat|cmat|cuet|clat|nift|nata|bitsat|viteee"
-    r"|srmjeee|comedk|kcet|eamcet|ts\s*emcet|ap\s*emcet|mht\s*cet|wbjee"
-    r"|kiitee|ipu\s*cet|net|gpat|ielts|toefl|pte|duolingo|gmat|gre|sat"
-    r"|cet|nmat|snap|iift|tissnet|ugat|aiapget|neet\s*pg|inicet)\b", re.I)
-
-# Tokens that name nothing a student could act on. "Course Name Common" is the
-# source DB's placeholder and appears in thousands of rows; matched loosely
-# because it turns up as "Course Common" and "Course Name Common" both.
-_JUNK_TOKEN = re.compile(r"^(course(\s+name)?\s*common|common|others?"
-                         r"|n\.?a\.?|none|nil|any|all|test|default|-+)$", re.I)
+# The exam/board classifier lives in store/db.py (split_exams_and_boards) and is
+# shared with the card renderer, so a token cannot be classified one way when it
+# is stored and another way when it is shown. It used to be duplicated here, and
+# two copies of a regex this fiddly is two copies that drift.
+#
+# Why the split exists at all. Measured over 15,000 detail rows, selectionCriteria
+# mixes three unrelated things:
+#   school boards      CBSE 12th (29,823), ISC (27,601), UP 12th, WBCHSE, AHSEC,
+#                      Maharashtra HSC, RBSE, ICSE, Karnataka 2nd PUC
+#   entrance exams     JEE Main (4,244), NEET PG (2,514), MHT CET, CUET, GATE
+#   foreign tests      IELTS (2,148), TOEFL, PTE — abroad listings only
+# Calling IELTS an "accepted board" would be a wrong fact, and "which exams does
+# this college accept" is the more useful question anyway.
+#
+# The placeholder check below stays local: it applies to PROSE, not to a token
+# list, and it is the signal that a value is two scraped fields run together.
+_JUNK_CONTAINS = re.compile(r"courses?(\s+name)?\s*common|common\s+course", re.I)
 
 
 def _boards(value: str) -> tuple[str | None, dict | None, str]:
@@ -138,15 +197,31 @@ def _boards(value: str) -> tuple[str | None, dict | None, str]:
     if _BOILERPLATE.search(v):
         return None, None, "website navigation text"
 
-    boards, exams = [], []
+    if _is_page_scrape(v):
+        return None, None, "scraped page furniture"
+
+    boards, exams, unknown = [], [], 0
     for part in re.split(r"[,;/]| and ", v):
         p = part.strip()
-        if not (2 <= len(p) <= 60) or _BARE_NUMBER.match(p) or _JUNK_TOKEN.match(p):
+        if not (2 <= len(p) <= 60) or token_is_junk(p):
             continue
-        (exams if _EXAM_TOKENS.search(p) else boards).append(p)
+        # One classifier, shared with the card renderer (store/db.py), so a token
+        # cannot be an exam here and a board there.
+        got_exams, got_boards = split_exams_and_boards([p])
+        if got_exams:
+            exams.extend(got_exams)
+        elif got_boards:
+            boards.extend(got_boards)
+        else:
+            # Neither. Previously this fell into `boards` by default, which
+            # labelled state entrance exams and stray phrases as school boards.
+            # Dropped instead: an unrecognised token is not evidence of anything,
+            # and a wrong label on a real-looking value is worse than omission.
+            unknown += 1
 
     if not boards and not exams:
-        return None, None, "no recognisable board or exam names"
+        return None, None, (f"no recognisable board or exam names"
+                            f"{f' ({unknown} unclassifiable)' if unknown else ''}")
     payload: dict = {}
     if boards:
         payload["boards"] = boards[:12]

@@ -62,7 +62,8 @@ import httpx
 from .. import config  # noqa: F401 - loads .env before the backend reads it
 from ..store.backend import get_backend
 from .registries import (_index_by_city, _index_by_token, _load_catalogue,
-                         _load_place_aliases, _norm, ensure_tables, match_one)
+                         _load_place_aliases, _norm, _place_key, ensure_tables,
+                         match_one)
 
 ROOT = Path(__file__).resolve().parents[2]
 CACHE_DIR = ROOT / "data" / "raw" / "registries" / "naac"
@@ -181,15 +182,35 @@ def read_rows(path: Path) -> list[dict]:
     return out
 
 
-def _city_from_address(address: str, place_keys: set[str]) -> str:
+def _city_from_address(address: str, place_keys: set[str],
+                       hei_name: str = "") -> str:
     """Recover a city the catalogue knows from NAAC's free-text address.
 
     The sheet has no city column, and city agreement is what decides whether a
-    row is scored at the 0.72 floor or the 0.92 one — so this is worth doing
-    properly. Longest match wins: "navi mumbai" must beat "mumbai", or a Navi
-    Mumbai institution gets scored against Mumbai's colleges.
+    row is scored at the 0.72 floor or the 0.92 one, so a wrong city here is a
+    real loss of safety rather than a cosmetic error. Two things it must not do:
+
+    1. Read a place out of the INSTITUTION'S NAME. NAAC's Address cell routinely
+       begins with the institution's own name ("Andhra University, karakachettu
+       P.O ..."), and many Indian colleges are named after a place they are not
+       in — "Nagpur Institute of Technology, Wardha". The name is removed before
+       scanning, so only the address part can supply a city.
+
+    2. Prefer a district over a city. `place_keys` must therefore be CITY keys
+       only. registries.py now also indexes colleges by district, which put 135
+       district-only names into that vocabulary; because those names are often
+       longer than the town's, the longest-match rule below started choosing the
+       district and matching against every college in it.
+
+    Longest match still wins among cities, so "navi mumbai" beats "mumbai".
     """
-    hay = f" {_norm(address)} "
+    addr = _norm(address)
+    name = _norm(hei_name)
+    if name and addr.startswith(name):
+        addr = addr[len(name):]
+    elif name and len(name) > 12 and name in addr:
+        addr = addr.replace(name, " ")
+    hay = f" {addr} "
     best = ""
     for key in place_keys:
         if len(key) < 4 or len(key) <= len(best):
@@ -225,7 +246,11 @@ def run(*, dry_run: bool = False, refresh: bool = False,
     aliases = _load_place_aliases()
     by_city = _index_by_city(colleges, aliases)
     by_token = _index_by_token(colleges)
-    place_keys = {k for k in by_city if k}
+    # CITY keys only — see _city_from_address. by_city also holds district keys,
+    # and letting those into the address vocabulary made the longest-match rule
+    # resolve to a district, whose bucket is every college in it.
+    place_keys = {k for k in (_place_key(c.get("city"), aliases)
+                              for c in colleges) if k}
     print(f"[naac] matching {len(rows):,} graded institutions against "
           f"{len(colleges):,} catalogue colleges", file=sys.stderr)
 
@@ -240,7 +265,7 @@ def run(*, dry_run: bool = False, refresh: bool = False,
     samples: list[str] = []
 
     for r in rows:
-        city = _city_from_address(r["address"], place_keys)
+        city = _city_from_address(r["address"], place_keys, r["name"])
         if not city:
             stats["no_city"] += 1
         entry = {"name": r["name"], "city": city}
