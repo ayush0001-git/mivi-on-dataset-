@@ -180,9 +180,24 @@ def _normalise_filters(filters: dict | None) -> dict:
 
 
 def _like(value: str) -> str:
-    """A contains-pattern with LIKE metacharacters neutralised. SQLite's LIKE
-    is already case-insensitive for ASCII, which is why no LOWER() wrapper is
-    needed (and the state/city indexes stay usable for prefix-ish patterns)."""
+    """A contains-pattern with LIKE metacharacters neutralised.
+
+    Used with ILIKE, never LIKE. This docstring used to read "SQLite's LIKE is
+    already case-insensitive for ASCII, which is why no LOWER() wrapper is
+    needed" — true then, false the moment the store became Postgres, where LIKE
+    is case-SENSITIVE.
+
+    The consequence was total for course questions, and silent. The router
+    lowercases course terms, the corpus stores "BTech", and so:
+
+        SELECT COUNT(*) FROM courses WHERE title LIKE  '%btech%'  ->      0
+        SELECT COUNT(*) FROM courses WHERE title ILIKE '%btech%'  -> 20,891
+
+    "cheapest BTech college in Punjab" returned ZERO colleges out of the 1,027
+    this corpus holds for Punjab. No error, no empty-result warning that named a
+    cause — just a confident "we don't have that", which is the worst possible
+    failure for a counsellor.
+    """
     s = str(value).strip().replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
     return f"%{s}%"
 
@@ -216,13 +231,13 @@ def _where(f: dict) -> tuple[str, list]:
         if f.get(key):
             pat = _like(f[key])
             clauses.append(
-                "(c.state LIKE ? ESCAPE '\\' OR c.city LIKE ? ESCAPE '\\' "
-                "OR c.district LIKE ? ESCAPE '\\')"
+                "(c.state ILIKE ? ESCAPE '\\' OR c.city ILIKE ? ESCAPE '\\' "
+                "OR c.district ILIKE ? ESCAPE '\\')"
             )
             params += [pat, pat, pat]
 
     if f.get("college_type"):
-        clauses.append("c.type LIKE ? ESCAPE '\\'")
+        clauses.append("c.type ILIKE ? ESCAPE '\\'")
         params.append(_like(f["college_type"]))
 
     # Budget is tested against the college's CHEAPEST course: a college
@@ -256,7 +271,7 @@ def _where(f: dict) -> tuple[str, list]:
         if terms:
             ors = []
             for t in terms:
-                ors.append("(cr.title LIKE ? ESCAPE '\\' OR cr.full_name LIKE ? ESCAPE '\\')")
+                ors.append("(cr.title ILIKE ? ESCAPE '\\' OR cr.full_name ILIKE ? ESCAPE '\\')")
                 sub_params += [_like(t), _like(t)]
             sub.append("(" + " OR ".join(ors) + ")")
             # When a student names BOTH a course and a budget, the budget is
@@ -283,7 +298,7 @@ def _where(f: dict) -> tuple[str, list]:
     if f.get("entrance_exam"):
         # college_agg.entrance_exams is a JSON array of strings; a LIKE over the
         # serialised array is an adequate containment test and needs no json1.
-        clauses.append("a.entrance_exams LIKE ? ESCAPE '\\'")
+        clauses.append("a.entrance_exams ILIKE ? ESCAPE '\\'")
         params.append(_like(f["entrance_exam"]))
 
     # TRUE, not 1. SQLite treated `WHERE 1` as truthy; Postgres rejects it with
