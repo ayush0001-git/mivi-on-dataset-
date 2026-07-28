@@ -58,7 +58,7 @@ def main() -> None:
         moving = "WRITING NOW" if age < 120 else f"last write {age / 60:.0f}m ago"
         with raw.open("rb") as fh:                       # 45k+ lines; count bytes
             rows = sum(chunk.count(b"\n") for chunk in iter(lambda: fh.read(1 << 20), b""))
-        _p("  detail JSONL (not yet in DB)", f"{rows:,} rows | {moving}")
+        _p("  detail JSONL on disk", f"{rows:,} rows | {moving}")
 
     print("\nENRICHMENT")
     for label, sql in (

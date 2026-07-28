@@ -76,9 +76,13 @@ QUERY_PREFIX = "query: "
 # Sentence-transformers' own batch size. 128 keeps CPU batches full without a
 # multi-GB activation spike; override when the ETL is not competing for cores.
 DEFAULT_BATCH = int(os.getenv("MME_EMBED_BATCH", "128"))
-# A 4 GB laptop GPU holds a MiniLM-class model plus this batch comfortably; the
-# CPU default is far too small to keep a GPU busy.
-GPU_BATCH = int(os.getenv("MME_EMBED_BATCH_GPU", "512"))
+# Bigger than the CPU default (which cannot keep a GPU fed) but deliberately not
+# huge. Measured on a 4 GB RTX 3050: batch 512 filled dedicated VRAM to
+# 3.9/4.0 GB and spilled into "shared GPU memory", which is system RAM -- host
+# memory hit 97% and the CPU downclocked to 0.98 GHz while a crawler was still
+# running. A batch that quietly borrows host RAM is worse than a smaller one:
+# throughput gains flatten well before this point anyway.
+GPU_BATCH = int(os.getenv("MME_EMBED_BATCH_GPU", "192"))
 
 # Flush a partial index this often (in newly embedded cards). A 54 MB write
 # costs ~0.2 s; losing 20 minutes of embedding to a killed terminal costs more.

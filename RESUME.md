@@ -3,6 +3,20 @@
 Everything below is resumable and idempotent. Postgres is the only store.
 Run `python status.py` first — it reports the LIVE state, which is what matters.
 
+## Reading a running job's progress
+
+**Progress lines go to `data/raw/*_run.err`, not `*_run.log`.** The `.log` files
+are stdout and are 0 bytes, which reads as "dead job" at a glance. Tail the
+`.err`.
+
+**The detail crawler's progress is not in the database.** It appends to
+`data/raw/colleges_detail.jsonl` and only reaches Postgres when the ETL runs, so
+its DB counter sits still for hours while it works normally. Two separate
+sessions called a healthy crawl dead by reading that counter. `status.py` now
+reports the JSONL's row count and mtime instead. Low CPU is also expected: the
+crawler is AIMD-throttled to ~0.5-1 req/s against MakeMyEducation's 429s and is
+idle on network waits by design.
+
 ## Jobs that were running when this was written (28 Jul 2026)
 
 All three were started detached and survive a closed terminal. Check them with
@@ -24,8 +38,38 @@ All three were started detached and survive a closed terminal. Check them with
 | Verified CONFIRMED | 1,670 · quarantined 474 |
 | NIRF rankings | 236 colleges |
 | Maharashtra FRA approved fees | 100 colleges |
+| Admission criteria | 148,631 facts · 24,182 colleges (62%) |
 | Firecrawl | 3 keys pooled, ~2,200 spendable credits |
 | OCR | Tesseract 5.4 installed and wired |
+| Embedding device | GPU when usable (`pick_device`), else CPU |
+
+## Where the missing data actually came from
+
+Worth knowing before spending another day on the web: the client's OWN detail
+crawl held far more than the open web did. `sources/admission_ingest.py`
+recovered 148,631 admission criteria covering 24,182 colleges from JSONL already
+on disk. The web sweep, after days of crawling, has 3,714 facts across 2,871
+colleges. Measured on the hardest slice, the sweep returns ~60 facts per 1,750
+colleges: 82% of those sites publish nothing extractable and 15% block.
+
+So: exhaust what is already downloaded before crawling for it.
+
+## Closed questions — do not re-investigate
+
+- **Annual fees cannot be derived.** Course duration is present on 2 of 40,669
+  detail course objects and 10 of 211,071 catalogue rows. `feesDescription`
+  mentions a per-year figure in 0 of 21,266 values. The whole-programme total is
+  the only honest output.
+- **Maharashtra FRA is matched out at 100 colleges.** Of its 524 rejections, 503
+  had no candidate in the corpus at all and the 6 near-misses have no close
+  corpus name. That is a corpus limit, not a matcher bug.
+- **NIRF still has ~33 recoverable institutions** in the near-miss band,
+  including IIT Delhi, Shiv Nadar (0.913) and IIFT (0.917). These score ABOVE
+  the 0.78 floor, so a gate other than the score is rejecting them. Not yet
+  diagnosed — this one IS worth finishing.
+- **admissionStatus and admissionMode are schema defaults**, not observations:
+  "Open" on 265,566 of 265,567 rows and "Merit Based" on 85,814 of 85,815. Never
+  render them.
 
 ## The finding that matters most
 
