@@ -93,14 +93,36 @@ class Corpus:
 
     def __init__(self) -> None:
         self.conn: sqlite3.Connection | None = None
+        self.backend = None
         self.names: dict[str, str] | None = None
         self.source = "none"
+
+        # POSTGRES FIRST. This runner still preferred data/mivi.db, which the
+        # migration retired — a 451 MB file left on disk from the day before.
+        # The suite whose job is catching stale expectations was therefore
+        # validating truth_sql against a stale corpus: no admission criteria, no
+        # NAAC, no registry facts, and fees from before the whole-programme
+        # correction. An eval that reads the wrong database is worse than no
+        # eval, because it reports PASS.
+        try:
+            from rag_core.store.backend import get_backend
+
+            be = get_backend()
+            be.one("SELECT 1 FROM colleges LIMIT 1")
+            self.backend = be
+            self.source = f"postgres:{be.label if hasattr(be, 'label') else 'live'}"
+            return
+        except Exception as exc:  # noqa: BLE001 - fall back, but say so
+            print(f"[corpus] Postgres unavailable ({str(exc)[:90]})",
+                  file=sys.stderr)
+
         if DB_FILE.exists():
             try:
                 self.conn = sqlite3.connect(
                     f"file:{DB_FILE.as_posix()}?mode=ro", uri=True)
                 self.conn.execute("SELECT 1 FROM colleges LIMIT 1")
-                self.source = f"sqlite:{DB_FILE}"
+                self.source = f"sqlite:{DB_FILE} (LEGACY — retired by the "
+                self.source += "Postgres migration; results may be stale)"
                 return
             except sqlite3.Error as e:
                 # A half-built DB is worse than none: fall back loudly rather
@@ -122,13 +144,16 @@ class Corpus:
 
     @property
     def sql_ok(self) -> bool:
-        return self.conn is not None
+        return self.backend is not None or self.conn is not None
 
     @property
     def available(self) -> bool:
-        return self.conn is not None or self.names is not None
+        return self.sql_ok or self.names is not None
 
     def name_of(self, college_id: str) -> str | None:
+        if self.backend is not None:
+            return self.backend.one(
+                "SELECT name FROM colleges WHERE college_id=?", [college_id])
         if self.conn is not None:
             row = self.conn.execute(
                 "SELECT name FROM colleges WHERE college_id=?", (college_id,)
@@ -142,6 +167,8 @@ class Corpus:
         return self.name_of(college_id) is not None
 
     def scalar(self, sql: str):
+        if self.backend is not None:
+            return self.backend.one(sql)
         assert self.conn is not None
         return self.conn.execute(sql).fetchone()[0]
 
@@ -218,8 +245,11 @@ def validate_case(case: dict, corpus: Corpus, seen_ids: set) -> tuple[list[str],
         else:
             try:
                 got = corpus.scalar(case["truth_sql"])
-            except sqlite3.Error as e:
-                problems.append(f"truth_sql failed: {e}")
+            # Not sqlite3.Error: the corpus is Postgres now, and catching only
+            # the SQLite exception let a psycopg error escape and kill the whole
+            # dry run instead of failing the one case that asked for it.
+            except Exception as e:  # noqa: BLE001
+                problems.append(f"truth_sql failed: {str(e)[:150]}")
             else:
                 want = case["truth_value"]
                 if str(got) != str(want):

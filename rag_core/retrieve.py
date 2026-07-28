@@ -286,7 +286,13 @@ def _where(f: dict) -> tuple[str, list]:
         clauses.append("a.entrance_exams LIKE ? ESCAPE '\\'")
         params.append(_like(f["entrance_exam"]))
 
-    return (" AND ".join(clauses) if clauses else "1"), params
+    # TRUE, not 1. SQLite treated `WHERE 1` as truthy; Postgres rejects it with
+    # "argument of WHERE must be type boolean". Every query with NO filters —
+    # which is exactly the plain "tell me about <college>" lookup — was therefore
+    # failing outright in production. The eval suite caught it the moment it was
+    # pointed at the real corpus, and could not have caught it before, because it
+    # was still reading the retired SQLite file.
+    return (" AND ".join(clauses) if clauses else "TRUE"), params
 
 
 # ---------------------------------------------------------------------------

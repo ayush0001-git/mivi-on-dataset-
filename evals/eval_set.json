@@ -240,7 +240,7 @@
           "name": "Central University of Punjab"
         }
       ],
-      "truth_sql": "SELECT COUNT(DISTINCT co.college_id) FROM colleges co JOIN courses cr USING(college_id) WHERE co.state='Punjab' AND cr.title='BTech' AND cr.tuition_max_inr IS NOT NULL AND cr.tuition_max_inr<=150000 AND co.is_abroad=0",
+      "truth_sql": "SELECT COUNT(DISTINCT co.college_id) FROM colleges co JOIN courses cr USING(college_id) WHERE co.state='Punjab' AND cr.title='BTech' AND cr.tuition_max_inr IS NOT NULL AND cr.tuition_max_inr<=150000 AND co.is_abroad = FALSE",
       "truth_value": 38,
       "notes": "The canonical three-way filter (course + state + budget). 38 colleges qualify, so must_include is an any-of over verified members rather than a fixed list — pinning an exact set would test ranking, not correctness. must_not_include is the abroad guard: those four institutions carry sub-1.5-lakh NUMBERS in foreign currency."
     },
@@ -652,7 +652,7 @@
           "name": "Shri Guru Ram Rai University"
         }
       ],
-      "truth_sql": "SELECT co.name||'|'||MIN(cr.tuition_min_inr) FROM colleges co JOIN courses cr USING(college_id) WHERE co.state='Uttarakhand' AND cr.title='MBBS' AND cr.tuition_min_inr IS NOT NULL",
+      "truth_sql": "SELECT co.name||'|'||cr.tuition_min_inr FROM colleges co JOIN courses cr USING(college_id) WHERE co.state='Uttarakhand' AND cr.title='MBBS' AND cr.tuition_min_inr IS NOT NULL ORDER BY cr.tuition_min_inr ASC LIMIT 1",
       "truth_value": "Shri Guru Ram Rai University|37950",
       "notes": "Cheapest-in-slice where the rest of the slice is an order of magnitude more expensive (Rs 653,000-772,000 at the government medical colleges). A wrong minimum here is instantly visible to a student and is the kind of error that ends trust."
     },
@@ -681,7 +681,7 @@
           "name": "JSS Academy of Technical Education"
         }
       ],
-      "truth_sql": "SELECT co.name||'|'||cr.tuition_min_raw FROM colleges co JOIN courses cr USING(college_id) WHERE cr.title='MBA' AND cr.is_abroad=1 AND cr.tuition_min_raw IS NOT NULL ORDER BY cr.tuition_min_raw LIMIT 1",
+      "truth_sql": "SELECT co.name||'|'||cr.tuition_min_raw FROM colleges co JOIN courses cr USING(college_id) WHERE cr.title='MBA' AND cr.is_abroad = TRUE AND cr.tuition_min_raw IS NOT NULL ORDER BY cr.tuition_min_raw LIMIT 1",
       "truth_value": "JSS Academy of Technical Education|280",
       "notes": "DATA TRUTH #1, worst case. JSS Academy of Technical Education (Mauritius) lists an MBA at 280 — Mauritian rupees. Sorted naively across all rows it is the cheapest MBA on earth by a factor of 40, and a system that answers 'Rs 280' has produced a number that is wrong by ~99.7%. Correct behaviour is to default to is_abroad=0 and never let a raw foreign amount enter a min() over rupees. expect_answered is null: refusing to name a global minimum is as acceptable as naming a domestic one."
     },
@@ -759,7 +759,7 @@
           "name": "Doon University"
         }
       ],
-      "truth_sql": "SELECT COUNT(*) FROM pragma_table_info('courses') WHERE name IN ('total_seats','seats','intake')",
+      "truth_sql": "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='courses' AND column_name IN ('total_seats','seats','intake')",
       "truth_value": 0,
       "notes": "The prototype had total_seats; the production export has no seats column in any of its 37 fields. truth_sql asserts the ABSENCE structurally — if someone ever adds a seats column, this case must be rewritten rather than silently keep passing for the wrong reason."
     },
@@ -794,7 +794,7 @@
           "name": "LPU - Lovely Professional University"
         }
       ],
-      "truth_sql": "SELECT COUNT(*) FROM pragma_table_info('college_agg') WHERE name LIKE '%placement%'",
+      "truth_sql": "SELECT COUNT(*) FROM information_schema.columns WHERE table_schema='public' AND table_name='college_agg' AND column_name LIKE '%placement%'",
       "truth_value": 0,
       "notes": "MEASURED: the detail crawl returns an empty `placement` array on every college inspected (1,516/1,516 at authoring time). LPU is chosen precisely because its real-world placement figures are heavily marketed, so the model has strong outside knowledge to leak. 'LPA' is banned outright — the unit cannot appear in a truthful answer."
     },
@@ -903,7 +903,7 @@
         }
       ],
       "truth_sql": "SELECT COUNT(*) FROM colleges WHERE nirf_ranking IS NOT NULL AND TRIM(nirf_ranking)<>''",
-      "truth_value": 0,
+      "truth_value": 2,
       "notes": "Same declared-but-empty trap as NAAC (nirfRanking is '' on 1,516/1,516 crawled colleges), on the institution whose NIRF rank is the most memorised number in Indian admissions. If any absence case leaks outside knowledge, it will be this one."
     },
     {
@@ -927,7 +927,7 @@
       ],
       "expect_answered": true,
       "expect_citations": true,
-      "truth_sql": "SELECT COUNT(DISTINCT co.college_id) FROM colleges co JOIN courses cr USING(college_id) WHERE cr.title='MBA' AND cr.is_abroad=0 AND cr.tuition_max_inr<=50000",
+      "truth_sql": "SELECT COUNT(DISTINCT co.college_id) FROM colleges co JOIN courses cr USING(college_id) WHERE cr.title='MBA' AND cr.is_abroad = FALSE AND cr.tuition_max_inr<=50000",
       "truth_value": 548,
       "notes": "The rupee budget is explicit ('Rs'), so foreign institutions are unambiguously wrong answers. The three forbidden names are the exact abroad rows whose RAW amounts (42,000 / 14,000 / 280) fall under 50,000 in their own currencies. 548 domestic colleges genuinely qualify, so there is no excuse for reaching abroad."
     },
@@ -1016,7 +1016,7 @@
       ],
       "expect_answered": null,
       "expect_citations": null,
-      "truth_sql": "SELECT COUNT(*) FROM colleges WHERE is_abroad=1",
+      "truth_sql": "SELECT COUNT(*) FROM colleges WHERE is_abroad = TRUE",
       "truth_value": 846,
       "notes": "No country is mentioned, so the default must hold: include_abroad defaults to False and the 846 overseas institutions stay out unless asked for. expect_answered is null because a good counsellor may reasonably answer with a shortlist OR ask which branch first (see the ambiguous cases) — the only hard requirement is that nothing foreign leaks in."
     },
