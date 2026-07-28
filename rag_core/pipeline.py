@@ -482,13 +482,51 @@ def _parse_json(text):
         return json.loads(m.group(0), strict=False)
 
 
+# Lazy gazetteer for the heuristic fallback: the DISTINCT states and cities the
+# corpus actually contains, plus the curated aliases (vizag -> visakhapatnam).
+# One DB read per process, then a dict lookup per question.
+_gazetteer: dict | None = None
+_gazetteer_lock = threading.Lock()
+
+
+def _load_gazetteer() -> dict:
+    global _gazetteer
+    if _gazetteer is None:
+        with _gazetteer_lock:
+            if _gazetteer is None:
+                g = {"states": {}, "cities": {}, "alias": {}}
+                try:
+                    from .store.backend import get_backend
+                    be = get_backend()
+                    for r in be.q("SELECT DISTINCT state FROM colleges "
+                                  "WHERE state IS NOT NULL AND state <> ''"):
+                        g["states"][r["state"].strip().lower()] = r["state"].strip()
+                    # Cities shorter than 4 chars (Ara, Goa-as-city) collide with
+                    # ordinary words; the state pass already covers Goa.
+                    for r in be.q("SELECT DISTINCT city FROM colleges "
+                                  "WHERE city IS NOT NULL AND LENGTH(city) >= 4"):
+                        g["cities"][r["city"].strip().lower()] = r["city"].strip()
+                    for r in be.q("SELECT alias, canonical FROM place_alias"):
+                        g["alias"][r["alias"].strip().lower()] = r["canonical"].strip()
+                except Exception as exc:  # noqa: BLE001 - fallback must not die
+                    print(f"[route] gazetteer unavailable ({str(exc)[:60]}); "
+                          f"heuristic route will not extract places", file=sys.stderr)
+                _gazetteer = g
+    return _gazetteer
+
+
 def _heuristic_route(question):
     """Regex fallback if the router call fails: keep answering, log the incident.
 
-    Deliberately extracts no city/state: there is no gazetteer in this module
-    and guessing a place name out of free text would produce a hard SQL filter
-    that silently returns nothing. The place name still reaches retrieval
-    through the semantic/lexical query itself."""
+    This DOES extract state and city now, against the corpus's own place
+    vocabulary. It deliberately did not, on the argument that guessing a place
+    out of free text risks a hard filter that silently returns nothing — but the
+    measured cost of NOT extracting was worse and reached students: with the LLM
+    router rate-limited (routine on the free tier), "What is the oldest college
+    in Kerala?" ran superlatives over the whole of India and answered with the
+    wrong college. Matching the exact place names the corpus contains is a
+    lookup, not a guess; word boundaries keep "Ara" out of "separate".
+    """
     q = question.lower()
     filters, terms, note = {}, [], None
     m = re.search(r"(\d+(?:\.\d+)?)\s*(crore|cr\b)", q)
@@ -513,6 +551,27 @@ def _heuristic_route(question):
             filters["max_tuition_inr"] = amount
         else:
             filters["max_tuition_inr"] = amount
+    # Place extraction, longest name first so "navi mumbai" beats "mumbai" and
+    # "andhra pradesh" is matched as a state before "pradesh" can confuse a
+    # city. Aliases first, so "vizag" resolves before the exact-name passes.
+    gaz = _load_gazetteer()
+    qwords = f" {re.sub(r'[^a-z0-9]+', ' ', q)} "
+    for alias, canonical in gaz["alias"].items():
+        if f" {alias} " in qwords:
+            qwords = qwords.replace(f" {alias} ", f" {canonical.lower()} ")
+    for key in sorted(gaz["states"], key=len, reverse=True):
+        if f" {key} " in qwords:
+            filters["state"] = gaz["states"][key]
+            break
+    for key in sorted(gaz["cities"], key=len, reverse=True):
+        # A state name that is also a city name (Delhi) is already handled by
+        # the state pass; adding it again as a city would double-filter.
+        if key in gaz["states"]:
+            continue
+        if f" {key} " in qwords:
+            filters["city"] = gaz["cities"][key]
+            break
+
     if "government" in q or "sarkari" in q:
         filters["college_type"] = "Government"
     elif "private" in q or "praivet" in q:
@@ -603,6 +662,101 @@ def _sup_line(row):
     return f"{row['college_id']} {row.get('name', '(unnamed)')} ({'; '.join(bits)})"
 
 
+# A superlative question, detected in code rather than trusted to the router.
+#
+# The router is an LLM, and a small one asked "What is the oldest college in
+# Kerala?" answers question_kind="lookup", needs_all_records=false. Superlatives
+# are then never computed, no COMPUTED FACTS block is built, and the generator
+# answers from whichever card retrieval ranked first. Measured live: Kerala's
+# oldest came back as Kerala Kalamandalam (1930) instead of C.M.S College
+# (1817), and Uttarakhand's as a college founded in 2002 instead of IIT Roorkee
+# (1847) — confidently, with no hedge.
+#
+# This project's own rule is that the LLM never filters and never counts. A
+# cheap deterministic test that is right must not be overridden by a small
+# model's guess, so this ORs with the router rather than deferring to it. False
+# positives are nearly free: computing superlatives adds one SQL query.
+_SUPERLATIVE_RE = re.compile(
+    r"\b(cheapest|costliest|most\s+expensive|least\s+expensive|lowest|highest"
+    r"|oldest|earliest|newest|latest|largest|biggest|smallest|best|worst|top"
+    r"|most\s+\w+|fewest)\b"
+    r"|\bsabse\b|\bsab\s*se\b|\bsarvashreshth\b|सबसे",
+    re.I)
+
+
+def _asks_superlative(question: str) -> bool:
+    return bool(_SUPERLATIVE_RE.search(question or ""))
+
+
+# Which superlative a question is asking for, so the answer can be checked
+# against the one SQL computed. Ordered: the first pattern that matches wins,
+# and "cheapest MBBS" must not be read as "best".
+_SUP_INTENT = (
+    ("cheapest", r"cheapest|least\s+expensive|lowest\s+fee|most\s+affordable"
+                 r"|sabse\s+sasta|sasta"),
+    ("most_expensive", r"costliest|most\s+expensive|highest\s+fee|sabse\s+mehnga"),
+    ("oldest", r"oldest|earliest|first\s+established|sabse\s+purana|purana|सबसे\s*पुराना"),
+    ("newest", r"newest|latest|most\s+recent|sabse\s+naya"),
+    ("most_courses", r"most\s+courses|widest\s+range|sabse\s+zyada\s+course"),
+    ("best_ranked", r"\bbest\b|\btop\b|sabse\s+achha|sabse\s+accha|highest\s+rank"),
+)
+
+
+def _sup_intent(question: str) -> str | None:
+    q = (question or "").lower()
+    for key, pat in _SUP_INTENT:
+        if re.search(pat, q, re.I):
+            return key
+    return None
+
+
+def _superlative_violations(result, question, sup):
+    """The college SQL ranked first must be the one the answer names.
+
+    A prompt rule is not enough here. COMPUTED FACTS already carried "Oldest
+    (earliest established): C.M.S College (est. 1817)" and the generator still
+    answered "Kerala Kalamandalam ... established in 1930" — a college whose
+    name contains "Kerala", so retrieval ranked it first and the model took the
+    top CONTEXT card instead of the ranked line. Wrong, specific, and stated
+    without a hedge, which is the worst combination this system can produce.
+
+    So it is verified rather than requested: for a superlative question, the
+    computed winner must appear in the answer. Deliberately a presence test and
+    not a "no other college may be named" test — listing runners-up after the
+    answer is useful, and forbidding it would push the model toward terser,
+    less helpful replies.
+    """
+    if not result.get("answered") or not sup:
+        return []
+    key = _sup_intent(question)
+    rows = (sup or {}).get(key) or []
+    if not rows:
+        return []
+    top = rows[0]
+    name = str(top.get("name") or "").strip()
+    if not name:
+        return []
+    answer = str(result.get("answer") or "")
+
+    # Match on the distinctive head of the name: catalogue names carry long
+    # tails ("C.M.S College, Kottayam - affiliated to ...") that an answer has
+    # no reason to reproduce in full.
+    head = re.split(r"[,(]", name)[0].strip()
+    words = [w for w in re.findall(r"[A-Za-z][\w.'-]{2,}", head)
+             if w.lower() not in {"college", "university", "institute", "school",
+                                  "the", "and", "of", "for"}]
+    probe = " ".join(words[:3]) or head
+    if not probe:
+        return []
+    low = answer.lower()
+    if probe.lower() in low or all(w.lower() in low for w in words[:2]):
+        return []
+    label = _SUP_LABELS.get(key, key)
+    return [f"the answer does not name {name!r}, which SQL computed as "
+            f"#1 for {label!r} over the whole matching set — a superlative "
+            f"answer must name the computed winner, not the first CONTEXT card"]
+
+
 def _computed_facts(hits, sup=None, total=None):
     """State SQL-computed aggregates as facts so the model never does the math.
 
@@ -629,9 +783,26 @@ def _computed_facts(hits, sup=None, total=None):
                          + "; ".join(rendered))
     if not lines:
         return ""
-    return ("COMPUTED FACTS (derived in SQL over the full matching set, not just "
-            "CONTEXT — use these for any count/'best'/highest/lowest reasoning, "
-            "and cite the ids you name). Every college in CONTEXT ALREADY "
+    # The vocabulary here is load-bearing, and so is the imperative.
+    #
+    # This block used to say "use these for any count/'best'/highest/lowest
+    # reasoning". "Oldest" is neither "highest" nor "lowest" to a small model,
+    # and "use for reasoning" is not "this IS the answer" — so the model read
+    # the correct line and then answered from a CONTEXT card instead. Measured
+    # live: asked for Kerala's oldest college it said Kerala Kalamandalam (1930)
+    # while this block named C.M.S College (1817) on the line above; for
+    # Uttarakhand it said a college founded in 2002 over IIT Roorkee (1847).
+    # Confidently wrong, with the right answer already in the prompt.
+    return ("COMPUTED FACTS (derived in SQL over the FULL matching set, not just "
+            "CONTEXT). These are authoritative and already ranked.\n"
+            "RULE: if the question asks for a superlative — cheapest, costliest, "
+            "oldest, earliest, newest, latest, best, top, most/least, highest, "
+            "lowest, sabse sasta, sabse purana, sabse naya, sabse achha — the "
+            "answer IS the FIRST college on the matching line below. Name that "
+            "college and cite its id. Never name a college from CONTEXT as the "
+            "superlative: CONTEXT is a shortlist ranked by relevance, not by the "
+            "quantity asked about, so its first card is usually NOT the answer.\n"
+            "Cite the ids you name. Every college in CONTEXT ALREADY "
             "satisfies the user's stated budget/filters — never claim any of "
             "them exceeds the budget. A college with no tuition figure has none "
             "recorded; that never means free:\n- " + "\n- ".join(lines) + "\n")
@@ -1462,10 +1633,34 @@ def answer_question(question, history=None, known_profile=None):
         print(f"[router fallback] {e}", file=sys.stderr)
         route_info = _heuristic_route(question)
 
+    # The heuristic is a FLOOR, not just a fallback.
+    #
+    # It only ran when the LLM router raised. A router that returns valid JSON
+    # with no filters therefore erased every constraint silently — and under
+    # rate limiting the small model does exactly that. Measured: "Cheapest MBBS
+    # in Uttarakhand" answered "There are 38,700 colleges that match your
+    # criteria" (the whole corpus) because state and course were both dropped,
+    # while _heuristic_route extracted {state: Uttarakhand, course_terms:
+    # ['mbbs']} from the same string.
+    #
+    # This project's rule is that the LLM never filters. So a deterministic
+    # extraction is kept unless the LLM supplies that same key: the model may
+    # refine or correct a filter, it may not delete one it simply failed to
+    # notice.
+    floor = _heuristic_route(question)
+    floor_filters = _clean_filters(floor.get("filters"))
+    llm_filters = _clean_filters(route_info.get("filters"))
+    filters = {**floor_filters, **llm_filters}
+    if floor_filters and llm_filters != filters:
+        recovered = {k: v for k, v in floor_filters.items() if k not in llm_filters}
+        print(f"[router] recovered filters the model dropped: {recovered}",
+              file=sys.stderr)
+
     route = route_info.get("route", "data_query")
-    filters = _clean_filters(route_info.get("filters"))
     course_terms = filters.get("course_terms", [])
-    needs_all = bool(route_info.get("needs_all_records"))
+    needs_all = (bool(route_info.get("needs_all_records"))
+                 or bool(floor.get("needs_all_records"))
+                 or _asks_superlative(question))
     question_kind = route_info.get("question_kind")
     # Merge: facts the client already knew (survives history truncation) +
     # anything the router freshly extracted this turn. Client-known facts are
@@ -1489,7 +1684,14 @@ def answer_question(question, history=None, known_profile=None):
     # "that one is above your budget" impossible. Abroad is force-INCLUDED
     # here: a student naming a foreign institution must not be told we don't
     # have it just because the default view is domestic.
-    if question_kind == "lookup":
+    #
+    # NOT for a superlative. "What is the oldest college in Kerala?" is routed
+    # `lookup` by the small model, and wiping filters here threw away
+    # state=Kerala and opened the world: the oldest college came back as the
+    # University of Seville. A superlative is a ranking over a POPULATION, so
+    # discarding the population is the one thing that cannot happen to it —
+    # whatever the router called it.
+    if question_kind == "lookup" and not _asks_superlative(question):
         filters = {"include_abroad": True}
 
     # "Any other college nearby?" / "something else?" means the student wants
@@ -1691,6 +1893,7 @@ def answer_question(question, history=None, known_profile=None):
 
     # ---- 2c. SQL aggregates: counts and superlatives ------------------------
     total = None
+    sup: dict = {}          # read again by the verifier, so it must always exist
     if hits and (needs_all or question_kind in ("enumerate", "recommend")):
         total = _count(filters)
         # Superlatives are computed for recommendations too, not just
@@ -1986,6 +2189,7 @@ def answer_question(question, history=None, known_profile=None):
                     + _name_violations(result, hits)
                     + _voice_violations(result)
                     + _rank_violations(result, hits_by_id)
+                    + _superlative_violations(result, question, sup)
                     + _numeric_violations(result, hits_by_id, extra_ok))
         if not problems:
             verified = True

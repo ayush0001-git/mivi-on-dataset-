@@ -287,24 +287,26 @@ def _corpus_probe() -> dict[str, Any]:
     """Cheap-ish corpus facts. Always reached through the TTL snapshot AND a
     worker thread: COUNT(*) over 211k courses measured ~10 ms here, which is
     nothing once per 5 s and unacceptable on the event loop once per probe."""
+    # The store is Postgres. This used to report a `db_file` name and probe
+    # `DB_FILE.exists()` — SQLite's questions, answered by a compatibility shim,
+    # so /api/health described a file that has not been the store since the
+    # migration. Reported as a backend now, still without the DSN: this endpoint
+    # is public and must not publish credentials or host layout.
     info: dict[str, Any] = {
-        # Filename only, never the absolute path: /api/health is public, and
-        # publishing the server's filesystem layout is exactly what _safe_meta
-        # was written to prevent a few lines below — this field was bypassing it.
-        "db_file": db.DB_FILE.name, "present": db.DB_FILE.exists(),
+        "store": "postgres", "present": False,
         "colleges": 0, "courses": 0, "build": {}, "error": None,
     }
-    if not info["present"]:
-        info["error"] = "corpus not built"
-        return info
     try:
-        conn = db.get_conn()
-        info["colleges"] = conn.execute("SELECT COUNT(*) FROM colleges").fetchone()[0]
-        info["courses"] = conn.execute("SELECT COUNT(*) FROM courses").fetchone()[0]
+        from rag_core.store.backend import get_backend
+
+        be = get_backend()
+        info["colleges"] = be.one("SELECT COUNT(*) FROM colleges") or 0
+        info["courses"] = be.one("SELECT COUNT(*) FROM courses") or 0
+        info["present"] = True
         # Whatever the ETL recorded — build time, source fingerprints, index
         # dimensions. Read generically so the API does not have to be edited
         # every time the builder learns a new key.
-        rows = conn.execute("SELECT key, value FROM build_meta LIMIT 64").fetchall()
+        rows = be.q("SELECT key, value FROM build_meta LIMIT 64")
         info["build"] = {r["key"]: _safe_meta(r["value"]) for r in rows}
     except Exception as exc:  # noqa: BLE001 - a half-built DB is a normal state
         info["error"] = f"{type(exc).__name__}: {exc}"

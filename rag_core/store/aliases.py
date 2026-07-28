@@ -31,7 +31,16 @@ from .backend import get_backend
 # missing them — build_db seeds the table from this dict.
 CITY_ALIASES = {
     # Official renames still spoken the old way
-    "bangalore": "Bengaluru", "banglore": "Bengaluru", "bengaluru": "Bengaluru",
+    # Canonical is what THIS corpus writes, not the official rename. The header
+    # above says the corpus stores Bengaluru — true of the prototype CSV, false
+    # of the live catalogue, which writes "Bangalore" on 2,130 colleges and
+    # "Bengaluru" on none. An alias whose canonical the corpus never uses turns
+    # the student's word into a hard filter matching zero rows: "colleges in
+    # Bangalore" produced an empty result while 2,130 existed. Audit with:
+    #   SELECT p.canonical FROM place_alias p LEFT JOIN colleges c
+    #     ON LOWER(TRIM(c.city))=LOWER(p.canonical)
+    #   WHERE p.kind='city' GROUP BY 1 HAVING COUNT(c.college_id)=0
+    "bangalore": "Bangalore", "banglore": "Bangalore", "bengaluru": "Bangalore",
     "vizag": "Visakhapatnam", "vizagapatnam": "Visakhapatnam",
     "trivandrum": "Thiruvananthapuram",
     "gurgaon": "Gurugram",
@@ -57,7 +66,9 @@ CITY_ALIASES = {
     "tuticorin": "Thoothukudi",
     "simla": "Shimla",
     "cuttak": "Cuttack",
-    "orissa": "Odisha",
+    # "orissa" is NOT a city alias: Odisha is a state, no college has it as a
+    # city, and a city filter of 'Odisha' matches zero rows. The state alias
+    # below already handles it.
     # Common short forms
     "hyd": "Hyderabad", "vizianagaram": "Vizianagaram",
     "ncr": "Delhi", "new delhi": "Delhi",

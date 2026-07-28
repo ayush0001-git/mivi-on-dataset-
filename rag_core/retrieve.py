@@ -41,7 +41,7 @@ import threading
 import numpy as np
 
 from .store.backend import get_backend
-from .store.db import DB_FILE, fetch_colleges, get_conn, get_meta, render_card
+from .store.db import fetch_colleges, get_conn, get_meta, render_card
 
 # Reciprocal Rank Fusion constant. 60 is the published default and behaves
 # sanely here: 1/(60+rank) is nearly flat across the first few ranks, so a
@@ -311,27 +311,33 @@ _index_failed: str | None = None   # remembered so we warn once, not per query
 
 
 def _get_conn():
-    """Thread-local read-only connection, with a one-time sanity check that the
-    store actually exists and has been built (the ETL runs separately)."""
+    """The store handle, with a one-time check that the ETL has actually run.
+
+    Asks Postgres directly. This used to test `DB_FILE.exists()` and read
+    `sqlite_master` — questions in SQLite's vocabulary answered by a
+    compatibility shim, so a store that was DOWN produced "MIVI store not found
+    at <path>. Build it first (python -m rag_core.store.build)": a wrong
+    diagnosis pointing at a command that no longer exists.
+    """
     global _db_checked
     if not _db_checked:
         with _db_lock:
             if not _db_checked:
-                if not DB_FILE.exists():
+                be = get_backend()
+                try:
+                    rows = be.q(
+                        "SELECT table_name AS name FROM information_schema.tables "
+                        "WHERE table_schema = current_schema()")
+                except Exception as e:  # noqa: BLE001
                     raise RuntimeError(
-                        f"MIVI store not found at {DB_FILE}. Build it first "
-                        f"(python -m rag_core.store.build)."
-                    )
-                probe = get_conn()
-                tables = {
-                    r[0] for r in probe.execute(
-                        "SELECT name FROM sqlite_master WHERE type IN ('table','view')"
-                    )
-                }
+                        f"MIVI cannot reach Postgres ({str(e)[:120]}). The store "
+                        f"must be up before retrieval can serve anything."
+                    ) from e
+                tables = {r["name"] for r in rows}
                 missing = {"colleges", "courses", "college_agg"} - tables
                 if missing:
                     raise RuntimeError(
-                        f"{DB_FILE} is missing table(s) {sorted(missing)} — the "
+                        f"the store is missing table(s) {sorted(missing)} — the "
                         f"ETL has not finished. Retrieval cannot serve a partial store."
                     )
                 _db_checked = True

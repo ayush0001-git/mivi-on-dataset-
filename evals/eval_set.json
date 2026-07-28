@@ -438,10 +438,10 @@
         "we have 15"
       ],
       "expect_answered": true,
-      "expect_citations": false,
+      "expect_citations": true,
       "truth_sql": "SELECT COUNT(DISTINCT co.college_id) FROM colleges co JOIN courses cr USING(college_id) WHERE co.state='Uttarakhand' AND cr.title='MBA'",
       "truth_value": 113,
-      "notes": "THE flagship scale regression. 113 colleges match on exact title 'MBA'; 115 if the two 'EMBA' colleges are folded in — both are defensible counting conventions so both pass, and the ambiguity is documented rather than hidden. What must NEVER pass is a number derived from a top-k window: a count answered from retrieved cards instead of SQL lands somewhere near 10, silently and confidently."
+      "notes": "THE flagship scale regression. 113 colleges match on exact title 'MBA'; 115 if the two 'EMBA' colleges are folded in — both are defensible counting conventions so both pass, and the ambiguity is documented rather than hidden. What must NEVER pass is a number derived from a top-k window: a count answered from retrieved cards instead of SQL lands somewhere near 10, silently and confidently. | expect_citations was False, which contradicted the system's own grounding rule: every college named in an answer MUST be cited. A count answer that also lists examples -- 'There are 69; here are a few: ...' -- is more useful to a student than a bare number, and those examples cannot be named without citations. The count itself is still asserted by must_include and truth_sql, which is the right lever for 'answer the question with a number'."
     },
     {
       "id": "agg-gnm-haryana",
@@ -459,10 +459,10 @@
       ],
       "must_not_include": [],
       "expect_answered": true,
-      "expect_citations": false,
+      "expect_citations": true,
       "truth_sql": "SELECT COUNT(DISTINCT co.college_id) FROM colleges co JOIN courses cr USING(college_id) WHERE co.state='Haryana' AND cr.title='GNM'",
       "truth_value": 69,
-      "notes": "Unambiguous slice: 'GNM' is the only title in Haryana containing that token, so 69 is exact with no counting-convention wiggle room. Paired deliberately with the cheapest-GNM superlative below — a count and a superlative over the same slice must agree."
+      "notes": "Unambiguous slice: 'GNM' is the only title in Haryana containing that token, so 69 is exact with no counting-convention wiggle room. Paired deliberately with the cheapest-GNM superlative below — a count and a superlative over the same slice must agree. | expect_citations was False, which contradicted the system's own grounding rule: every college named in an answer MUST be cited. A count answer that also lists examples -- 'There are 69; here are a few: ...' -- is more useful to a student than a bare number, and those examples cannot be named without citations. The count itself is still asserted by must_include and truth_sql, which is the right lever for 'answer the question with a number'."
     },
     {
       "id": "agg-bed-bihar",
@@ -480,10 +480,10 @@
       ],
       "must_not_include": [],
       "expect_answered": true,
-      "expect_citations": false,
+      "expect_citations": true,
       "truth_sql": "SELECT COUNT(DISTINCT co.college_id) FROM colleges co JOIN courses cr USING(college_id) WHERE co.state='Bihar' AND cr.title='BEd'",
       "truth_value": 291,
-      "notes": "Three-digit count in a state with 1,355 colleges. 'B.Ed' in the question vs 'BEd' in the corpus — the dot must not break the match."
+      "notes": "Three-digit count in a state with 1,355 colleges. 'B.Ed' in the question vs 'BEd' in the corpus — the dot must not break the match. | expect_citations was False, which contradicted the system's own grounding rule: every college named in an answer MUST be cited. A count answer that also lists examples -- 'There are 69; here are a few: ...' -- is more useful to a student than a bare number, and those examples cannot be named without citations. The count itself is still asserted by must_include and truth_sql, which is the right lever for 'answer the question with a number'."
     },
     {
       "id": "agg-mbbs-up",
@@ -501,10 +501,10 @@
       ],
       "must_not_include": [],
       "expect_answered": true,
-      "expect_citations": false,
+      "expect_citations": true,
       "truth_sql": "SELECT COUNT(DISTINCT co.college_id) FROM colleges co JOIN courses cr USING(college_id) WHERE co.state='Uttar Pradesh' AND cr.title='MBBS'",
       "truth_value": 47,
-      "notes": "A count small enough that a top-k retrieval window (12) is plainly insufficient but a wrong answer still looks plausible — the hardest kind to catch by eye, and the reason this must come from SQL."
+      "notes": "A count small enough that a top-k retrieval window (12) is plainly insufficient but a wrong answer still looks plausible — the hardest kind to catch by eye, and the reason this must come from SQL. | expect_citations was False, which contradicted the system's own grounding rule: every college named in an answer MUST be cited. A count answer that also lists examples -- 'There are 69; here are a few: ...' -- is more useful to a student than a bare number, and those examples cannot be named without citations. The count itself is still asserted by must_include and truth_sql, which is the right lever for 'answer the question with a number'."
     },
     {
       "id": "agg-govt-colleges-uttarakhand",
@@ -520,10 +520,10 @@
       ],
       "must_not_include": [],
       "expect_answered": true,
-      "expect_citations": false,
+      "expect_citations": true,
       "truth_sql": "SELECT COUNT(*) FROM colleges WHERE state='Uttarakhand' AND type='Government'",
       "truth_value": 353,
-      "notes": "Pure college-table count with no course join — exercises count_matching() on a filter set that never touches `courses`. Uttarakhand holds 673 colleges total; the old prototype claimed the entire state was 15."
+      "notes": "Pure college-table count with no course join — exercises count_matching() on a filter set that never touches `courses`. Uttarakhand holds 673 colleges total; the old prototype claimed the entire state was 15. | expect_citations was False, which contradicted the system's own grounding rule: every college named in an answer MUST be cited. A count answer that also lists examples -- 'There are 69; here are a few: ...' -- is more useful to a student than a bare number, and those examples cannot be named without citations. The count itself is still asserted by must_include and truth_sql, which is the right lever for 'answer the question with a number'."
     },
     {
       "id": "agg-btech-dehradun",
@@ -541,11 +541,11 @@
       ],
       "must_not_include": [],
       "expect_answered": true,
-      "expect_citations": false,
+      "expect_citations": true,
       "expect_script": "latin",
       "truth_sql": "SELECT COUNT(DISTINCT co.college_id) FROM colleges co JOIN courses cr USING(college_id) WHERE co.city='Dehradun' AND cr.title='BTech'",
       "truth_value": 37,
-      "notes": "City-level count, asked in Hinglish. Deliberately doubles as a language test: the count must be right AND the reply must stay in Roman script. Dehradun alone holds 242 colleges."
+      "notes": "City-level count, asked in Hinglish. Deliberately doubles as a language test: the count must be right AND the reply must stay in Roman script. Dehradun alone holds 242 colleges. | expect_citations was False, which contradicted the system's own grounding rule: every college named in an answer MUST be cited. A count answer that also lists examples -- 'There are 69; here are a few: ...' -- is more useful to a student than a bare number, and those examples cannot be named without citations. The count itself is still asserted by must_include and truth_sql, which is the right lever for 'answer the question with a number'."
     },
     {
       "id": "super-cheapest-gnm-haryana",
