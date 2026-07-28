@@ -485,6 +485,27 @@ def match_one(entry: dict, by_city: dict, by_token: dict,
         # collide constantly.
         if nirf_ac and len(nirf_ac) >= 4 and nirf_ac == _acronym(c["name"]):
             score = max(score, 0.88)
+
+        # THE SAME NAME, RESTATED WITH ITS LOCATION.
+        #
+        # Catalogue names routinely append the place: the registry writes "ANDHRA
+        # UNIVERSITY" and the catalogue holds "Andhra University, Visakhapatnam".
+        # difflib scores that 0.71 — below the 0.72 floor — purely because of the
+        # appended city, and the A++ / CGPA 3.74 of one of the state's best-known
+        # universities was dropped over 0.012 of string similarity.
+        #
+        # This is not a loosening. Every gate above has already passed: same
+        # family, every distinctive registry word present, acronym intact, no
+        # foreign leading brand. The ONLY difference between the two strings is a
+        # place name that the row's own city agreement confirms. Requiring the
+        # remainder to BE the matched place is what keeps it narrow — a candidate
+        # carrying any other extra word does not qualify.
+        if city_backed and nirf_city:
+            extra = cat_sig - nirf_sig
+            place_words = set(nirf_city.split())
+            if extra and extra <= place_words:
+                score = max(score, 0.85)
+
         if score > best_score:
             best, best_score, why = c, score, (
                 f"name~{ratio:.2f} overlap~{overlap:.2f} "

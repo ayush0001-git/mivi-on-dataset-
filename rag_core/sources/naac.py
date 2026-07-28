@@ -183,7 +183,7 @@ def read_rows(path: Path) -> list[dict]:
 
 
 def _city_from_address(address: str, place_keys: set[str],
-                       hei_name: str = "") -> str:
+                       hei_name: str = "", state_keys: set[str] | None = None) -> str:
     """Recover a city the catalogue knows from NAAC's free-text address.
 
     The sheet has no city column, and city agreement is what decides whether a
@@ -204,20 +204,46 @@ def _city_from_address(address: str, place_keys: set[str],
 
     Longest match still wins among cities, so "navi mumbai" beats "mumbai".
     """
-    addr = _norm(address)
-    name = _norm(hei_name)
+    # Punctuation becomes whitespace before anything else. NAAC writes addresses
+    # comma-packed with no spaces — "Waltair,Visakhapatnam,Visakhapatnam,Andhra
+    # Pradesh,530003" — and _norm keeps the commas, so a word-boundary search for
+    # " visakhapatnam " found nothing and the scan fell through to the state.
+    # This alone was losing Andhra University's A++ / CGPA 3.74.
+    addr = re.sub(r"[^a-z0-9]+", " ", _norm(address)).strip()
+    name = re.sub(r"[^a-z0-9]+", " ", _norm(hei_name)).strip()
     if name and addr.startswith(name):
         addr = addr[len(name):]
     elif name and len(name) > 12 and name in addr:
         addr = addr.replace(name, " ")
     hay = f" {addr} "
-    best = ""
-    for key in place_keys:
-        if len(key) < 4 or len(key) <= len(best):
-            continue
-        if f" {key} " in hay:
-            best = key
-    return best
+    states = state_keys or set()
+
+    # Two passes, because a STATE is a weaker locator than a city and longest
+    # match alone gets this backwards. 1,410 catalogue rows carry a state name in
+    # their city column — mostly genuine city-states (Delhi 883, Puducherry 100,
+    # Chandigarh 61) but also plain errors (Bihar 167) — so state names are in
+    # this vocabulary either way.
+    #
+    # Measured consequence: NAAC's "Andhra University, karakachettu P.O,
+    # Visakhapatnam, Andhra Pradesh" resolved to "andhra pradesh" purely because
+    # it is one character longer than "visakhapatnam". That scored 0 candidates
+    # and A++ / CGPA 3.74 was lost for one of the state's best-known
+    # universities.
+    #
+    # So a non-state place wins if the address has one; a state is only used when
+    # nothing better is present, which is also what makes Delhi still work.
+    for restrict_to_cities in (True, False):
+        best = ""
+        for key in place_keys:
+            if len(key) < 4 or len(key) <= len(best):
+                continue
+            if restrict_to_cities and key in states:
+                continue
+            if f" {key} " in hay:
+                best = key
+        if best:
+            return best
+    return ""
 
 
 DDL = """
@@ -251,6 +277,9 @@ def run(*, dry_run: bool = False, refresh: bool = False,
     # resolve to a district, whose bucket is every college in it.
     place_keys = {k for k in (_place_key(c.get("city"), aliases)
                               for c in colleges) if k}
+    # State names, so the address scan can prefer a city over a state.
+    state_keys = {k for k in (_place_key(c.get("state"), aliases)
+                              for c in colleges) if k}
     print(f"[naac] matching {len(rows):,} graded institutions against "
           f"{len(colleges):,} catalogue colleges", file=sys.stderr)
 
@@ -265,7 +294,7 @@ def run(*, dry_run: bool = False, refresh: bool = False,
     samples: list[str] = []
 
     for r in rows:
-        city = _city_from_address(r["address"], place_keys, r["name"])
+        city = _city_from_address(r["address"], place_keys, r["name"], state_keys)
         if not city:
             stats["no_city"] += 1
         entry = {"name": r["name"], "city": city}
