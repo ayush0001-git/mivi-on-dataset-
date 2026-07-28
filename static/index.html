@@ -76,20 +76,24 @@
 <div id="chat">
   <div class="msg bot">Hello! 👋 I'm mimi, your personal MME college counsellor — let's find your perfect college, step by step. To begin: how much did you score in Class 12 (%)?</div>
   <div id="examples">
-    <button class="exchip">Which colleges offer an MBA?</button>
-    <button class="exchip">Best engineering college under ₹1.5 lakh/year</button>
-    <button class="exchip">Scholarships for low-income families</button>
-    <button class="exchip">सबसे सस्ता कॉलेज कौन सा है?</button>
+    <!-- Scoped to what the catalogue can actually answer well: a location and
+         a course. An unscoped "which colleges offer an MBA?" now matches
+         thousands of rows, and "scholarships for low-income families" has no
+         data behind it at all — both made poor first impressions. -->
+    <button class="exchip">Which colleges in Dehradun offer MBA under ₹2 lakh a year?</button>
+    <button class="exchip">Cheapest BTech colleges in Punjab</button>
+    <button class="exchip">Government colleges in Kerala offering GNM nursing</button>
+    <button class="exchip">जयपुर में BCA कॉलेज कौन से हैं?</button>
   </div>
 </div>
 
 <footer>
   <div class="inputrow">
-    <input id="q" placeholder="e.g. Which colleges offer an MBA, and what do they cost?" autocomplete="off">
+    <input id="q" placeholder="Ask in English, हिन्दी or Hinglish — e.g. Which MBA colleges in Pune are under ₹2 lakh a year?" autocomplete="off">
     <button id="webtoggle" title="Experimental: answer from the live web via Firecrawl. Results cite URLs and are UNVERIFIED — the normal mode answers only from the verified dataset.">🌐 Web: off</button>
     <button id="send">Send</button>
   </div>
-  <div class="hint">Every answer is grounded in the verified dataset (C001–C015) and cites its source records. The 🌐 toggle switches to an experimental live-web mode (unverified, URL citations).</div>
+  <div class="hint">Every answer is grounded in MakeMyEducation's live catalogue — 38,700 colleges and 211,071 course offerings — and every cited college links back to its page on makemyeducation.com. The 🌐 toggle switches to an experimental live-web mode (unverified, URL citations).</div>
 </footer>
 
 <script>
@@ -104,15 +108,18 @@ function addUser(text){ chat.appendChild(el("div","msg user",text)); scroll(); }
 
 // Works from http://localhost:8000 AND when the file is opened directly.
 const BASE = location.protocol === "file:" ? "http://localhost:8000" : "";
-const API = BASE + "/api/answer";
+const CHAT_API = BASE + "/api/chat";     // college mode: session-aware, returns linkable colleges
+const WEB_API  = BASE + "/api/answer";   // web mode keeps the legacy contract
 // Conversation memory: the counsellor sees the recent turns of THIS chat.
 const chatHistory = [];
 // Running student profile — survives the whole session even once older
 // turns scroll out of the (last-6) history window sent to the server.
 let studentProfile = {};
-// id -> "College Name, City" so citations read like colleges, not codes.
-let COLLEGES = {};
-fetch(BASE + "/api/colleges").then(r => r.json()).then(m => { COLLEGES = m; }).catch(() => {});
+// Server-side session id. The server keeps the authoritative history under
+// this key; we still send our own recent turns so a restarted server (or a
+// session evicted by TTL) degrades to the old stateless behaviour instead of
+// forgetting the conversation outright.
+let sessionId = null;
 
 function renderAnswer(container, text){
   const lines = (text || "(no answer)").split("\n");
@@ -160,6 +167,19 @@ function addBot(result, isWeb, question){
         meta.appendChild(a);
       }
     });
+  } else {
+    // Cited colleges as real links. The server sends name + city + the public
+    // URL, because a citation id IS the makemyeducation.com slug — so every
+    // claim is one click from the page it came from. Rendering raw ObjectIds
+    // here would be worse than showing nothing.
+    (result.colleges || []).forEach(c => {
+      if (!c || !c.url) return;
+      const label = c.city ? `${c.name} — ${c.city}` : c.name;
+      const a = el("a","chip url", label);
+      a.href = c.url; a.target = "_blank"; a.rel = "noopener";
+      a.title = "Open on makemyeducation.com";
+      meta.appendChild(a);
+    });
   }
   const copy = el("button","copybtn","📋");
   copy.title = "Copy answer";
@@ -186,13 +206,22 @@ async function ask(question, mode, prefs){
     }, 1200);
   }
   try{
-    const r = await fetch(API, {
+    const isWeb = mode === "web";
+    const r = await fetch(isWeb ? WEB_API : CHAT_API, {
       method:"POST", headers:{"Content-Type":"application/json"},
-      body: JSON.stringify({question, mode, prefs: prefs || null,
-                            history: chatHistory.slice(-6),
-                            known_profile: studentProfile})
+      body: JSON.stringify(isWeb
+        ? {question, mode, prefs: prefs || null}
+        : {message: question, session_id: sessionId,
+           history: chatHistory.slice(-6), profile: studentProfile})
     });
+    if (r.status === 429){                       // rate limited: say so plainly
+      throw new Error("Too many questions just now — give it a few seconds.");
+    }
+    if (r.status === 503){                       // corpus/index not ready yet
+      throw new Error("The college data is still loading on the server. Try again in a moment.");
+    }
     const data = await r.json();
+    if (data.session_id) sessionId = data.session_id;
     if (data.profile) studentProfile = data.profile;   // grows, never resets mid-session
     if (stageTimer) clearInterval(stageTimer);
     t.remove();
@@ -204,7 +233,12 @@ async function ask(question, mode, prefs){
   }catch(e){
     if (stageTimer) clearInterval(stageTimer);
     t.remove();
-    addBot({answer:"Could not reach the server. Start it with:\n  uvicorn app:app --port 8000\nthen open http://localhost:8000 in your browser.", citations:[], answered:false}, false, question);
+    // A rate-limit or not-ready message is actionable; "can't reach the server"
+    // in its place would send the student off debugging the wrong problem.
+    const reachable = e && e.message && !/fetch|network|Failed to fetch/i.test(e.message);
+    addBot({answer: reachable ? e.message
+              : "Could not reach the server. Start it with:\n  uvicorn app:app --port 8000\nthen open http://localhost:8000 in your browser.",
+            citations:[], answered:false}, false, question);
   }
 }
 
@@ -217,6 +251,13 @@ document.querySelectorAll(".exchip").forEach(b => {
 document.getElementById("reset").onclick = () => {
   chatHistory.length = 0;
   studentProfile = {};
+  // Free the server-side transcript too, rather than leaving it to age out of
+  // the TTL — "start over" should mean the counsellor has actually forgotten.
+  if (sessionId){
+    fetch(BASE + "/api/session/" + encodeURIComponent(sessionId), {method:"DELETE"})
+      .catch(() => {});
+    sessionId = null;
+  }
   const keep = chat.children[0];          // the greeting
   const chips = document.getElementById("examples");
   chat.innerHTML = "";
