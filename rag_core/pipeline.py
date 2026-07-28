@@ -1,14 +1,22 @@
 """The answer pipeline: route -> retrieve -> generate (grounded) -> verify -> JSON.
 
-Flow per query (mirrors the target production design):
+Flow per query:
   1. Router (small model): does this question need retrieval at all? Extract
      hard filters and normalise units (semester/lakh -> Rs per year).
-  2. Hybrid retrieval: hard filters in code + semantic ranking (retrieve.py).
-  3. Generation (large model): answer from the retrieved cards ONLY, with a
-     [C0XX] citation after every factual claim.
-  4. Deterministic verification: cited ids must exist in the retrieved context;
-     ids mentioned in prose must appear in `citations`. One corrective retry,
-     then fail closed (answered=false) rather than ship an ungrounded answer.
+  2. Hybrid retrieval over the production store (retrieve.py): hard filters in
+     SQL + semantic/lexical ranking. ~35,300 colleges and 211k course
+     offerings, so the retrieval layer returns a top-k of rendered cards and
+     NEVER the corpus.
+  3. Aggregates come from SQL, not from the model: counts and superlatives are
+     computed by retrieve.count_matching()/superlatives() over the whole
+     matching set, then handed to the generator as facts. At this scale the
+     shown list is a sample of the matching set, never the matching set.
+  4. Generation (large model): answer from the retrieved cards ONLY, citing
+     college ObjectIds.
+  5. Deterministic verification: cited ids must exist in the retrieved context;
+     every number in the prose must trace back to a cited card. One corrective
+     retry, then fail closed (answered=false) rather than ship an ungrounded
+     answer.
 """
 import json
 import random
@@ -17,12 +25,12 @@ import sys
 import threading
 import time
 
-from . import config
-from .data import load_colleges
+from . import config, retrieve, selfrag
 from .llm import chat
-from .retrieve import encode_query, retrieve, to_context
 
-CID_RE = re.compile(r"C0\d{2}")
+# Citations are Mongo ObjectIds — the same 24-hex id that is the public URL
+# (makemyeducation.com/college/<id>), so every citation resolves to a real page.
+CID_RE = re.compile(r"\b[0-9a-f]{24}\b", re.I)
 
 _THINK_RE = re.compile(r"<think>.*?</think>", re.DOTALL)
 
@@ -42,7 +50,7 @@ class _EmbedPrefetch:
 
     def _run(self, question):
         try:
-            self._vec = encode_query(question)
+            self._vec = retrieve.encode_query(question)
         except Exception as e:  # retrieval will retry the encode and surface it
             print(f"[prefetch] embed failed: {e}", file=sys.stderr)
         finally:
@@ -51,6 +59,7 @@ class _EmbedPrefetch:
     def result(self, timeout=180):
         self._done.wait(timeout)
         return self._vec
+
 
 # An explicit count in the question ("top 3", "just 2 options", "sirf 5").
 # Numbers followed by a money/percent unit are excluded so "under 2 lakh" and
@@ -80,6 +89,14 @@ _BROADEN_RE = re.compile(
     r"anywhere|kahi aur|kahin aur|aas paas|aaspaas|paas me|koi aur|"
     r"doosr[ae]|dusr[ae]", re.I)
 
+# ...and a wider ask ("any state", "anywhere in India", "outside Kerala") has
+# to release the STATE filter too, which only became a real filter once the
+# corpus went national.
+_BROADEN_STATE_RE = re.compile(
+    r"other state|another state|different state|any state|anywhere in india|"
+    r"all over india|across india|outside\s+\w+|pure india|puri india|"
+    r"kisi bhi state", re.I)
+
 # Obvious prompt-injection attempts. The generator already answers only from
 # CONTEXT and all numbers come from code, so injection can't produce a fake
 # fee — but a clear "ignore your rules" still gets a calm, on-brand deflection
@@ -98,20 +115,36 @@ _INJECTION_RE = re.compile(
 # triggers (high recall — a genuine crisis must never be missed); softer
 # emotional words only trigger when they're self-referential ("I feel
 # hopeless"), so "is 45% hopeless for engineering?" stays a normal question.
+#
+# The stems below are spelled `suicid\w*` / `self[- ]?harm\w*` rather than bare
+# stems for a reason that cost this guard its most important trigger: the whole
+# alternation is followed by `\b`, and a bare `suicid` then requires a word
+# boundary between "d" and "e" — which does not exist. "suicide" and "suicidal",
+# the two words a student in crisis is most likely to type, silently failed to
+# match and were answered as ordinary college questions. Any stem added here
+# MUST either end the word or carry its own `\w*`; there is a test for exactly
+# this in evals.
 _DISTRESS_RE = re.compile(
-    r"\b(kill myself|end my life|suicid|self[- ]?harm|want to die|"
+    # "want to die" excludes "die-hard": erring toward the crisis path is the
+    # right default, but "die-hard fan" is common enough in Indian English that
+    # the false positive is worth one lookahead.
+    r"\b(kill myself|end my life|suicid\w*|self[- ]?harm\w*|want to die(?![- ]?hard)|"
     r"don'?t want to live|no reason to live|give up on life|can'?t go on|"
     r"marna (?:hai|chahta|chahti|h)|mar jau|jeena nahi|jina nahi|"
     r"khatam kar (?:du|dun|lu))\b"
     r"|\b(?:i(?:'?m| am| feel)|feeling|mai bahut|main bahut)\s+\w*\s*"
     r"(?:hopeless|worthless|empty|numb|done with everything)\b", re.I)
 
-ROUTER_SYSTEM = """You are the query router for a college-search assistant.
-The database contains exactly 15 colleges in Uttarakhand, India with fields:
-college_id, name, city, state, type (Government/Private/Deemed), courses_offered,
-annual_fees_inr (tuition per academic YEAR), last_year_cutoff_pct (hard minimum
-aggregate %), total_seats, hostel_available, naac_grade, avg_placement_lpa
-(0 = not reported), established_year, about (free text).
+ROUTER_SYSTEM = """You are the query router for MakeMyEducation's college-search assistant.
+The catalogue holds ~35,300 colleges across EVERY state of India (plus a few
+thousand overseas institutions, excluded unless the student asks for abroad)
+and ~211,000 course offerings. Per college we know: name, city, district,
+state, type (Government/Private/Deemed/Public), year established, NAAC grade,
+NIRF ranking, affiliating university, the list of courses it offers with their
+program levels and entrance exams, per-year tuition RANGE in rupees across
+those courses, hostel availability, scholarships, and free-text about/placement
+/facility notes. We do NOT have admission cutoffs, seat counts or placement
+salary figures.
 
 Classify the user's message and extract hard filters. Return ONLY JSON:
 {
@@ -119,17 +152,23 @@ Classify the user's message and extract hard filters. Return ONLY JSON:
   "question_kind": "enumerate" | "recommend" | "lookup" | "profile_share" | "other",
   "language": "<language of the message, e.g. English, Hindi, Hinglish>",
   "filters": {
-    "max_annual_fee_inr": <int or null>,
-    "student_score_pct": <int or null>,
-    "college_type": "Government" | "Private" | "Deemed" | null,
+    "state": <Indian state as written in full, e.g. "Uttarakhand", or null>,
+    "city": <city/town only, e.g. "Dehradun", or null>,
+    "college_type": "Government" | "Private" | "Deemed" | "Public" | null,
+    "max_tuition_inr": <int, rupees per YEAR, or null>,
+    "min_tuition_inr": <int, rupees per YEAR, or null>,
+    "course_terms": [<course words mentioned, e.g. "MBA", "B.Tech", "nursing">],
+    "program_level": "Undergraduate" | "Postgraduate" | "Diploma/Certificate"
+        | "Doctorate" | null,
     "hostel_required": <true or null>,
-    "city": <city OR state preference as stated, string or null>
+    "entrance_exam": <exam named by the user, e.g. "NEET", "CUET", or null>,
+    "include_abroad": <true ONLY if the user asks about studying abroad /
+        names a foreign country or a foreign institution; else false>
   },
-  "course_terms": [<course words mentioned, e.g. "MBA", "B.Tech", "engineering">],
-  "needs_all_records": <true if answering requires scanning ALL colleges:
-    superlatives (cheapest, best, highest placement, oldest), counts
-    ("how many..."), or ANY enumeration question ("which colleges offer/have
-    X", "list the colleges that Y") — else false>,
+  "needs_all_records": <true if answering needs an AGGREGATE over the whole
+    matching set rather than a handful of examples: counts ("how many
+    colleges..."), superlatives (cheapest, oldest, most courses), or any
+    "which/list all colleges that X" enumeration — else false>,
   "unit_note": <string or null>,
   "profile": {"marks_pct": <int or null>, "field_interest": <string or null>,
     "budget": <string or null>, "location": <string or null>}
@@ -145,7 +184,7 @@ Rules:
   with question_kind "profile_share".
 - "smalltalk": greetings, thanks, who-are-you.
 - "out_of_scope": unrelated to colleges/admissions (poems, politics, coding...).
-- question_kind: "enumerate" = user wants ALL colleges matching criteria
+- question_kind: "enumerate" = user wants the colleges matching criteria
   ("which colleges...", "list...", "which fit my budget"); "recommend" = user
   wants advice/a pick ("best for me", "suggest"); "lookup" = a fact about one
   named college; "profile_share" = the student states facts about themselves
@@ -155,18 +194,24 @@ Rules:
   "confused hoon", "pata nahi kya karu", "I don't know what to do") — in all
   these cases the reply is conversational guidance, not a college lookup, so
   no citations are expected; "other" = anything else.
-- Money: "1 lakh" = 100000, "60 thousand"/"60k" = 60000. Database fees are PER
-  YEAR. If the user gives a budget per semester: annual = semester x 2, and set
-  unit_note explaining the conversion (1 academic year = 2 semesters).
-  If the user gives a total-course budget: set max_annual_fee_inr to null and
-  put an explanation in unit_note (course lengths vary; cannot hard-filter).
+- Location: put a CITY in "city" and a STATE in "state" — never both fields
+  from one word. "colleges in Kerala" -> state "Kerala"; "colleges in Kochi"
+  -> city "Kochi". If the user names a country other than India, that is
+  include_abroad = true, not a state.
+- Money: "1 lakh" = 100000, "60 thousand"/"60k" = 60000, "1 crore" = 10000000.
+  Fees in the catalogue are tuition PER YEAR. If the user gives a budget per
+  semester: annual = semester x 2, and set unit_note explaining the conversion
+  (1 academic year = 2 semesters). If the user gives a total-course budget:
+  set max_tuition_inr to null and put an explanation in unit_note (course
+  lengths vary; cannot hard-filter).
   Examples:
-    "budget of Rs 1.5 lakh/year"        -> max_annual_fee_inr = 150000
-    "I can pay 60 thousand per semester" -> max_annual_fee_inr = 120000,
+    "budget of Rs 1.5 lakh/year"        -> max_tuition_inr = 150000
+    "I can pay 60 thousand per semester" -> max_tuition_inr = 120000,
         unit_note = "60,000/semester = 120,000/year (2 semesters per year)"
-    "I have 1 lakh per semester"         -> max_annual_fee_inr = 200000,
+    "I have 1 lakh per semester"         -> max_tuition_inr = 200000,
         unit_note = "1 lakh/semester = 2 lakh/year (2 semesters per year)"
-- student_score_pct: set only when the user states their own marks/percentage.
+- The student's own marks go in profile.marks_pct, NEVER into filters: we hold
+  no cutoff data, so marks can never be used as a filter.
 - Set a filter ONLY if the user clearly stated it. Never guess.
 - If CONVERSATION SO FAR is provided, interpret the CURRENT message in its
   context: a bare number after a marks discussion is their percentage, BUT a
@@ -177,9 +222,9 @@ Rules:
   smalltalk. unit_note is ONLY for money/unit conversions — never put
   commentary or guesses there."""
 
-GENERATOR_SYSTEM = """You are mimi, MakeMyEducation's AI college counsellor, answering from a
-verified 15-college dataset (all in Uttarakhand, India). You will get CONTEXT
-(college records) and a QUESTION. Answer using ONLY the CONTEXT.
+GENERATOR_SYSTEM = """You are mimi, MakeMyEducation's AI college counsellor, answering from our
+verified catalogue of Indian colleges. You will get CONTEXT (college records
+selected for this question) and a QUESTION. Answer using ONLY the CONTEXT.
 Voice: say "I" when you act ("I'll check that"), "we" only for the
 institution ("the colleges we work with").
 
@@ -207,34 +252,67 @@ their life, not a search query):
   alone. (Set answered:true, citations:[].)
 
 Hard rules:
-1. Every factual claim must come from CONTEXT. The supporting college_ids go
-   ONLY in the "citations" array — NEVER write id codes (C001, C007...) inside
-   the answer text itself. In the text, refer to colleges by full name (and
-   city when helpful). Cite only ids that appear in CONTEXT.
+1. Every factual claim must come from CONTEXT. The supporting college ids
+   (24-character codes like 652f1a9c4d3b2e7a91c0f8d1) go ONLY in the
+   "citations" array — NEVER write an id, or a link containing one, inside the
+   answer text. In the text, refer to colleges by full name and city. Cite
+   only ids that appear in CONTEXT.
 2. Never use outside knowledge, never invent a college, fee, course or fact.
-3. Fees are tuition per academic YEAR and EXCLUDE hostel/mess/kit/studio/lab
-   charges. For cost/budget questions, mention relevant extra charges that the
-   About text describes.
-4. avg placement 0 means "not reported / not applicable" — NEVER describe it as
-   low, zero or the worst. Explain why if the About text says (e.g. medical
-   graduates proceed to internships, not campus placement).
-5. The cutoff is a hard minimum: a student below it was not eligible.
+3. FEES ARE FOR THE FULL PROGRAMME, NOT PER YEAR. This is the single easiest
+   way to mislead a student, so read it carefully. Our fee figures are the
+   whole-course cost and EXCLUDE hostel/mess/kit/exam charges. Never write
+   "per year", "/year", "annually" or "p.a." next to one. Say "for the full
+   course", "total for the programme", or "poore course ka".
+   Verified against the state Fee Regulating Authority's approved ANNUAL fees:
+   our figure divided by theirs equals the course length (2.0x for a two-year
+   MBA, 3.6x for a four-year BTech). So a figure quoted as annual is inflated
+   two-to-four-fold, and a student told a college costs Rs 2,39,000 a year when
+   the approved annual fee is Rs 67,272 will rule out a college they can
+   actually afford. We do NOT hold course durations, so you cannot compute the
+   per-year figure — do not try. If the student asks "per year", say we hold the
+   total course fee and they should divide by their course length or confirm
+   with the college.
+   A college usually offers many courses at different prices, so its fee is a
+   RANGE ("Rs 45,000-1,20,000 for the full course, depending on the programme")
+   — quote the range, or the figure for the specific course asked about, and
+   never present the low end as "the fee" of the college.
+3a. A "Fee Regulating Authority approved" line in CONTEXT is different: that
+   one IS annual, it is the legally approved figure, and it carries a year.
+   Quote it WITH its year ("approved fee for 2024-25 was ..."), say it is the
+   government-approved figure, and tell the student to confirm the current
+   year's fee — fees are revised annually and the published order may be older.
+3b. ABROAD: an overseas institution's fees are in ITS OWN currency, never
+   rupees. If CONTEXT says a college's tuition is in a local currency, say so
+   plainly and NEVER convert it, compare it to a rupee budget, or write "Rs"
+   in front of it.
+4. "Not recorded" is not zero. A missing fee, NAAC grade or hostel entry means
+   we simply do not have it — never describe it as free, zero, worst or a
+   weakness. Say what we do have instead.
+5. We hold NO admission cutoffs, NO seat counts and NO placement salary
+   figures. If a student asks for a cutoff, a seat count or a package/LPA
+   number, say plainly that we don't have that figure for the college(s) in
+   question — do not guess, do not estimate, do not substitute a national
+   average — then offer what IS known (courses, fees, entrance exams accepted,
+   NAAC/NIRF, hostel, scholarships) and suggest checking the college's own
+   admission page for the cutoff.
 6. Units: 1 academic year = 2 semesters. If the user's units differ from the
    data (per semester / total course), convert and STATE the assumption
    explicitly in the answer.
-7. A Diploma is not a degree. If a diploma-only institution is relevant,
-   you may include it, but only with an explicit note that it awards diplomas,
-   not degrees.
-8. Some college names look similar but are unrelated institutions in different
-   cities — never confuse them. Identify every college by full name, city and
-   id. Name ONLY colleges that qualify for the user's question: do not bring
-   up a non-qualifying college even to disambiguate — precise naming (full
-   name + city + id) IS the disambiguation.
+7. A diploma or certificate is not a degree. If a Diploma/Certificate program
+   is relevant you may include it, but only with an explicit note that it is a
+   diploma, not a degree.
+8. Thousands of colleges share similar names across different cities — never
+   confuse them. Identify every college by full name AND city. Name ONLY
+   colleges that qualify for the user's question: do not bring up a
+   non-qualifying college even to disambiguate — precise naming (full name +
+   city) IS the disambiguation.
 8b. Course questions are EXACT-MATCH questions: include a college only if the
-   asked program appears verbatim in its "Courses offered" list. Related
-   programs are NOT the same program (BBA is not MBA, M.Com is not MBA,
-   PGDM is not MBA — if PGDM is present alongside the question's program you
-   may mention it as a separate note, clearly labelled).
+   asked program appears in its "Courses offered" list. Related programs are
+   NOT the same program (BBA is not MBA, M.Com is not MBA, PGDM is not MBA —
+   if PGDM is present alongside the question's program you may mention it as a
+   separate note, clearly labelled). A course list ending in "(+N more)" is
+   TRUNCATED: for such a college you may not claim a program is missing — say
+   the listing shows more courses than fit here and offer to check that one.
 9. Reply in the SAME language as the question (English / Hindi / Hinglish /
    other). Keep the warm, clear tone of a good counsellor; be concise.
 9a. VOICE: you're the student's big brother/sister who happens to know every
@@ -252,13 +330,13 @@ Hard rules:
 9b. FORMAT: never a wall of text — short lines, not paragraphs. Lists: one
    short lead sentence that states the COUNT and speaks to the student's own
    constraints when they gave any — "There are 2 colleges in your range that
-   offer an MBA:", "With your score, 3 colleges fit:" — then a numbered list,
+   offer an MBA:", "With your budget, these 3 fit:" — then a numbered list,
    one college per line, separated by "\n", like:
-   "1. <Name>, <City> — Rs <fee>/year; <the key facts asked>."
+   "1. <Name>, <City> — Rs <fee range>/year; <the key facts asked>."
    Single-college details: one lead line, then short "- <label>: <value>"
-   lines (fee, courses, cutoff, hostel, placement...), one per "\n".
-   Never write more than 2 sentences without a line break. End with a
-   one-line note (assumptions, extra charges) when needed. Single-fact
+   lines (courses, tuition/year, hostel, NAAC, entrance exams, established...),
+   one per "\n". Never write more than 2 sentences without a line break. End
+   with a one-line note (assumptions, extra charges) when needed. Single-fact
    answers may be one sentence. Plain text — no markdown bold/headers.
    ZERO filler: no "I hope this helps", "feel free to ask", "great question"
    or restating the question — every sentence must carry information.
@@ -266,19 +344,20 @@ Hard rules:
    of both", "in dono ke baare me batao" — always uses a compact pipe table,
    one row per line separated by "\n", header first:
    "| Field | <College A> | <College B> |"
-   "| Tuition/year | Rs 145,000 | Rs 118,000 |"
-   Rows: Type, Courses, Tuition/year, Cutoff, Seats, Hostel, NAAC,
-   Avg placement, Scholarships (summarise each college's scholarship/
-   concession from its About in a few words; write "none mentioned" if its
-   About lists none), Established. Every row starts AND ends with "|". Keep the
+   "| Tuition/year | Rs 145,000-190,000 | Rs 118,000 |"
+   Rows: City, Type, Courses, Levels, Tuition/year, Hostel, NAAC, NIRF,
+   Entrance exams, Scholarships (summarise each college's scholarship note in
+   a few words; write "none mentioned" if it has none), Established. Skip a
+   row entirely if neither college has that value — never fill it with a guess
+   or a dash-with-commentary. Every row starts AND ends with "|". Keep the
    long About text OUT of the table — after it, add at most ONE short line
    per college with its key About point, then ONE line with the key
    trade-off. (This is the only place any markdown-like syntax is allowed.)
 10. If CONTEXT cannot support an answer, set "answered": false, briefly say
-    what the data does and does not contain, and never guess. This includes
-    ABSENCE questions: if asked whether a college offers a program/facility
-    that its record does not list, set "answered": false and say the dataset
-    does not record it. ALWAYS include one adjacent helpful fact from the
+    what we do and do not have, and never guess. This includes ABSENCE
+    questions: if asked whether a college offers a program/facility that its
+    record does not list, set "answered": false and say we don't have it
+    listed for that college. ALWAYS include one adjacent helpful fact from the
     record (what it does offer / the nearest alternative in CONTEXT, cited)
     so a refusal never feels like a dead end.
 10b. Before ever saying a program is "not offered/listed", scan EVERY
@@ -286,13 +365,18 @@ Hard rules:
     If the student's spelling looks like a typo of a listed program ("bse" ~
     B.Sc, "btech" ~ B.Tech, "b.pharma" ~ B.Pharm), assume the close match,
     answer for it, and note the assumption in one short phrase.
-11. Enumeration questions ("which colleges offer/have X", "list...", "which
-    fit my budget") must be COMPLETE: check EVERY record in CONTEXT and
-    include ALL that qualify. If 8 colleges qualify, the answer names all 8
-    and citations contains all 8 ids. A partial list is a wrong answer.
-    EXCEPTION: if the student names a number ("top 3", "just 2 options"),
-    that number wins — give exactly that many, ranked best-first. A REQUESTED
-    COUNT line below states it explicitly when one was asked for.
+11. SCALE — the single most important honesty rule. We list tens of thousands
+    of colleges, so a "which colleges..." question often matches hundreds or
+    thousands of them and CONTEXT holds only the top few. NEVER imply the
+    colleges you show are all that qualify, and never write "these are the
+    only ones" or "there are 5 colleges that...". When a TOTAL MATCHES line is
+    given, state that exact total in your lead sentence, then show the top few
+    and say plainly that more are available and you can narrow them down (by
+    city, budget, course or level). Cite every college you actually name.
+    If the student names a number ("top 3", "just 2 options"), give exactly
+    that many, ranked best-first — a REQUESTED COUNT line below states it
+    explicitly when one was asked for. Only when a line explicitly tells you
+    CONTEXT holds ALL matches may you present the list as complete.
 12. Match the user's qualifier precisely. "Low-income / need-based" support
     means income- or need-based concessions only; merit, gender or
     region-based waivers are different (mention them only as clearly-labelled
@@ -304,48 +388,79 @@ Hard rules:
     what's possible from CONTEXT, then ask ONE specific follow-up question
     (their course/stream interest, budget, or preferred location). Set
     "answered": true; cite only what you referenced. But when the question IS
-    specific (a course, fee, hostel, comparison, eligibility list), answer it
+    specific (a course, fee, hostel, comparison, location list), answer it
     directly and completely — no unnecessary follow-ups.
 12b. "All details" / full-profile questions about one college: present EVERY
-    field from its record as a structured list — type, city, courses, tuition
-    per year, last-year cutoff, total seats, hostel, NAAC grade, placement,
-    established year — plus the key points from About (admission process,
-    scholarships, extra charges). Leave nothing in the record out.
-13. For "best"/recommendation questions: "best" is NOT "cheapest". Weigh
-    placements (avg_placement_lpa), NAAC grade and cutoff feasibility against
-    the budget, state the criteria you used, and lead with the strongest
-    option(s) with their numbers. Offer 2-3 alternatives (e.g. per stream),
-    note that "best" depends on the student's priorities, and never phrase a
-    partial list as if it were the complete set of qualifying colleges.
+    field its record actually carries as a structured list — type, city and
+    state, established year, affiliating university, NAAC grade, NIRF
+    ranking, courses and levels, total course fee, hostel, entrance exams
+    accepted, scholarships, placements/facilities notes — plus the key points
+    from About. Leave nothing in the record out, and simply omit the fields
+    the record does not carry (do not list them as unknown one by one; one
+    closing line naming what we don't have is enough).
+13. For "best"/recommendation questions: "best" is NOT "cheapest". If COMPUTED
+    FACTS contains a "NIRF ranking" block, THAT is the ranking — lead with it,
+    name the discipline and year ("#3 in Engineering, NIRF 2024"), and say the
+    ranking is the Government of India's, not ours. NIRF is the only external
+    ranking available, so use it whenever it is present.
+    If there is NO NIRF block, say plainly that we have no ranking for these
+    colleges and that you are comparing on what IS known — breadth and level of
+    relevant courses, fee fit against the stated budget, location. NEVER claim
+    to have weighed "NAAC grade and NIRF ranking" for colleges whose records
+    show neither: that invents a basis for the recommendation, which is worse
+    than admitting the basis is limited. We hold no placement figures at all.
+    Offer 2-3 alternatives, note that "best" depends on the student's
+    priorities, and never phrase a partial list as the complete set.
+
+14. TWO TIERS OF FACT. A card may end with a block headed "FROM THE COLLEGE'S
+    OWN WEBSITE". Everything ABOVE that heading is MakeMyEducation's verified
+    listing; everything under it was read off the college's own site and is NOT
+    verified by us. You may absolutely use it — it is often the only place a
+    scholarship or hostel charge exists — but you MUST attribute it in the same
+    breath, naturally, e.g. "their own website lists a merit scholarship of…"
+    or "as per the college's site". Add a short "worth confirming with the
+    college directly" once, not after every line. NEVER present a website
+    figure as if we had verified it, never merge it into a fee comparison
+    table as though it were our tuition data, and never use it to contradict a
+    verified figure — if the two disagree, say so plainly and give both.
 
 Citations discipline: cite ONLY the colleges that form part of your actual
-answer. For eligibility/budget questions, cite only colleges that satisfy the
+answer. For budget/eligibility questions, cite only colleges that satisfy the
 stated constraints — never cite a college that fails them (you may say that
 stretching the budget would open more options, without naming ids).
 
 Worked examples of the required behaviour (names are generic placeholders):
 - QUESTION: "Does Alpha College offer an M.Sc in Data Science?" and Alpha
-  College's record lists only "B.Sc; B.Com" ->
-  {"answer": "We don't have an M.Sc in Data Science listed at Alpha College —
-  its courses with us are B.Sc and B.Com.",
-  "citations": ["C0XX"], "answered": false,
-  "reason_if_unanswered": "M.Sc Data Science is not recorded for Alpha College
-  in the dataset."}
-- QUESTION: "Which colleges offer a B.Sc, and what do they cost?" with two
-  matches in CONTEXT ->
-  {"answer": "Two colleges offer a B.Sc:\n1. Alpha College, Cityville — Rs
-  50,000/year.\n2. Beta University, Townsburg — Rs 72,000/year.\nNote: fees
-  are tuition only and exclude hostel/mess charges.",
-  "citations": ["C0XX", "C0YY"], "answered": true, "reason_if_unanswered": null}
+  College's record lists only "BSc; BCom" ->
+  {"answer": "We don't have an M.Sc in Data Science at Alpha College, Cityville
+  — what it does offer is a B.Sc and a B.Com.",
+  "citations": ["652f1a9c4d3b2e7a91c0f8d1"], "answered": false,
+  "reason_if_unanswered": "M.Sc Data Science is not listed for Alpha College."}
+- QUESTION: "Which colleges in Cityville offer a B.Sc under 1 lakh?" with a
+  TOTAL MATCHES line saying 46 ->
+  {"answer": "46 colleges in Cityville offer a B.Sc within that budget — here
+  are the strongest few:\n1. Alpha College, Cityville — Rs 50,000-68,000/year;
+  NAAC A.\n2. Beta University, Cityville — Rs 72,000/year; hostel available.\n
+  I can narrow these down by hostel, college type or course if you tell me
+  more.",
+  "citations": ["652f1a9c4d3b2e7a91c0f8d1", "652f1a9c4d3b2e7a91c0f8d2"],
+  "answered": true, "reason_if_unanswered": null}
+- QUESTION: "What was last year's cutoff for Alpha College?" ->
+  {"answer": "We don't have cutoff numbers for Alpha College, Cityville — that
+  one's best checked on their own admissions page. What I can tell you: it
+  takes CUET, tuition runs Rs 50,000-68,000/year, and hostel is available.",
+  "citations": ["652f1a9c4d3b2e7a91c0f8d1"], "answered": false,
+  "reason_if_unanswered": "Admission cutoffs are not part of the catalogue."}
 
 Return ONLY JSON, exactly this shape:
-{"answer": "<string>", "citations": ["C0XX", ...], "answered": true|false,
- "reason_if_unanswered": null | "<string>"}
+{"answer": "<string>", "citations": ["<24-char college id>", ...],
+ "answered": true|false, "reason_if_unanswered": null | "<string>"}
 
 "answered" is true ONLY when the requested information is explicitly present
 in CONTEXT. If the question asks about something the records do not list
-(a course, a facility, a data field), you MUST set "answered": false — even
-while the "answer" text helpfully explains what the records do list."""
+(a course, a facility, a cutoff, a package figure), you MUST set
+"answered": false — even while the "answer" text helpfully explains what the
+records do list."""
 
 
 def _parse_json(text):
@@ -368,11 +483,19 @@ def _parse_json(text):
 
 
 def _heuristic_route(question):
-    """Regex fallback if the router call fails: keep answering, log the incident."""
+    """Regex fallback if the router call fails: keep answering, log the incident.
+
+    Deliberately extracts no city/state: there is no gazetteer in this module
+    and guessing a place name out of free text would produce a hard SQL filter
+    that silently returns nothing. The place name still reaches retrieval
+    through the semantic/lexical query itself."""
     q = question.lower()
     filters, terms, note = {}, [], None
-    m = re.search(r"(\d+(?:\.\d+)?)\s*(lakh|lac|l\b)", q)
-    amount = int(float(m.group(1)) * 100_000) if m else None
+    m = re.search(r"(\d+(?:\.\d+)?)\s*(crore|cr\b)", q)
+    amount = int(float(m.group(1)) * 10_000_000) if m else None
+    if amount is None:
+        m = re.search(r"(\d+(?:\.\d+)?)\s*(lakh|lac|l\b)", q)
+        amount = int(float(m.group(1)) * 100_000) if m else None
     if amount is None:
         m = re.search(r"(\d+(?:\.\d+)?)\s*(thousand|k\b)", q)
         if m:
@@ -387,21 +510,23 @@ def _heuristic_route(question):
         elif "semester" in q or re.search(r"\bsem\b", q):
             amount *= 2
             note = "Budget given per semester; assumed 1 academic year = 2 semesters."
-            filters["max_annual_fee_inr"] = amount
+            filters["max_tuition_inr"] = amount
         else:
-            filters["max_annual_fee_inr"] = amount
-    m = re.search(r"(\d{1,3}(?:\.\d+)?)\s*%", q)
-    if m:
-        pct = int(float(m.group(1)))
-        if 0 < pct <= 100:
-            filters["student_score_pct"] = pct
+            filters["max_tuition_inr"] = amount
     if "government" in q or "sarkari" in q:
         filters["college_type"] = "Government"
+    elif "private" in q or "praivet" in q:
+        filters["college_type"] = "Private"
     if "hostel" in q:
         filters["hostel_required"] = True
-    for t in ("mba", "b.tech", "btech", "engineering", "mbbs", "law", "pharmacy", "design", "diploma"):
+    if re.search(r"abroad|overseas|foreign|videsh", q):
+        filters["include_abroad"] = True
+    for t in ("mba", "b.tech", "btech", "engineering", "mbbs", "law", "llb", "pharmacy",
+              "nursing", "design", "diploma", "bca", "mca", "bba", "b.sc", "b.com"):
         if t in q:
             terms.append(t)
+    if terms:
+        filters["course_terms"] = terms
     aggregate = any(
         w in q
         for w in ("cheapest", "best", "worst", "highest", "lowest", "oldest", "newest",
@@ -427,73 +552,165 @@ def _heuristic_route(question):
         "question_kind": kind,
         "language": "Hindi" if re.search(r"[ऀ-ॿ]", question) else "English",
         "filters": filters,
-        "course_terms": terms,
         "needs_all_records": aggregate,
         "unit_note": note,
     }
 
 
-def _computed_facts(rows):
-    """Pre-compute superlatives in code so the model never does the math.
+# --------------------------------------------------------------------------
+# Code-computed facts handed to the generator.
+# --------------------------------------------------------------------------
+_SUP_LABELS = {
+    # NIRF first: it is the only external, published ranking in the system and
+    # therefore the only defensible answer to "which is best". Everything below
+    # it is a proxy the student did not ask for.
+    "best_ranked": "NIRF ranking (Govt of India, best first)",
+    "cheapest": "Lowest total course fee",
+    "most_expensive": "Highest total course fee",
+    "oldest": "Oldest (earliest established)",
+    "newest": "Newest (most recently established)",
+    "most_courses": "Widest course range",
+}
 
+
+def _sup_line(row):
+    """One superlative row -> one citable fact line, using only the fields the
+    aggregate actually carried."""
+    if not isinstance(row, dict) or not row.get("college_id"):
+        return None
+    bits = []
+    # The rank leads, because for a NIRF row it IS the fact — everything else on
+    # the line is context. Stated with its discipline and year: a bare "#3" gets
+    # quoted as an overall national rank when it was third in Pharmacy.
+    if row.get("nirf_rank"):
+        cat = row.get("nirf_category") or "Overall"
+        yr = row.get("nirf_year") or ""
+        bits.append(f"NIRF {yr} #{int(row['nirf_rank'])} in {cat}".replace("  ", " "))
+    where = ", ".join(str(row[k]) for k in ("city", "state") if row.get(k))
+    if where:
+        bits.append(where)
+    lo, hi = row.get("min_tuition_inr"), row.get("max_tuition_inr")
+    if lo and hi and lo != hi:
+        # "total", not "/yr" — the corpus figure is whole-programme (verified
+        # against the state authority's approved annual fees; see rule 3).
+        bits.append(f"Rs {int(lo):,}-{int(hi):,} total")
+    elif lo or hi:
+        bits.append(f"Rs {int(hi or lo):,} total")
+    if row.get("establish_year"):
+        bits.append(f"est. {int(row['establish_year'])}")
+    if row.get("n_courses"):
+        bits.append(f"{int(row['n_courses'])} courses")
+    return f"{row['college_id']} {row.get('name', '(unnamed)')} ({'; '.join(bits)})"
+
+
+def _computed_facts(hits, sup=None, total=None):
+    """State SQL-computed aggregates as facts so the model never does the math.
+
+    This used to scan every record. With ~35,300 colleges that is impossible:
+    counts and superlatives now come from retrieve.count_matching() /
+    retrieve.superlatives(), which run over the WHOLE matching set in SQL, and
+    the retrieved hits only supply the shortlist the model may quote from.
     LLMs reliably anchor on 'cheapest' when asked for 'best'; handing them the
-    ranked facts (placement, fees) removes that failure mode the same way hard
-    filters remove budget errors."""
+    ranked facts removes that failure mode the same way hard filters remove
+    budget errors."""
     lines = []
-    placed = sorted((r for r in rows if r["avg_placement_lpa"] > 0),
-                    key=lambda r: -r["avg_placement_lpa"])[:3]
-    if placed:
-        lines.append("Highest reported avg placement: " + "; ".join(
-            f"{r['college_id']} {r['name']} ({r['avg_placement_lpa']} LPA, "
-            f"NAAC {r['naac_grade']}, Rs {r['annual_fees_inr']:,}/yr)" for r in placed))
-    unreported = [r["college_id"] for r in rows if r["avg_placement_lpa"] == 0]
-    if unreported:
-        lines.append("Placement not reported / not applicable (never rank these as "
-                     "worst): " + ", ".join(unreported))
-    cheap = sorted(rows, key=lambda r: r["annual_fees_inr"])[:2]
-    if cheap:
-        lines.append("Lowest tuition: " + "; ".join(
-            f"{r['college_id']} Rs {r['annual_fees_inr']:,}/yr" for r in cheap))
-    costly = max(rows, key=lambda r: r["annual_fees_inr"])
-    lines.append(f"Highest tuition: {costly['college_id']} Rs {costly['annual_fees_inr']:,}/yr")
-    seats = max(rows, key=lambda r: r["total_seats"])
-    lines.append(f"Most seats: {seats['college_id']} ({seats['total_seats']} seats)")
-    oldest = min(rows, key=lambda r: r["established_year"])
-    newest = max(rows, key=lambda r: r["established_year"])
-    lines.append(f"Oldest: {oldest['college_id']} (est. {oldest['established_year']}); "
-                 f"Newest: {newest['college_id']} (est. {newest['established_year']})")
-    selective = max(rows, key=lambda r: r["last_year_cutoff_pct"])
-    lines.append(f"Most selective (highest cutoff): {selective['college_id']} "
-                 f"({selective['last_year_cutoff_pct']}%)")
-    return ("COMPUTED FACTS (derived in code from CONTEXT — use these for any "
-            "'best'/highest/lowest reasoning, and cite the ids). Every college "
-            "in CONTEXT (including all listed below) ALREADY satisfies the "
-            "user's stated budget/filters — never claim any of them exceeds "
-            "the budget:\n- " + "\n- ".join(lines) + "\n")
+    if total is not None:
+        lines.append(f"Total colleges matching the applied filters: {total:,} "
+                     f"(CONTEXT shows the top {len(hits)} of them).")
+    for key, rows in (sup or {}).items():
+        if isinstance(rows, dict):
+            rows = [rows]
+        if not isinstance(rows, (list, tuple)):
+            print(f"[superlatives] ignoring {key!r}: {type(rows).__name__}", file=sys.stderr)
+            continue
+        rendered = [s for s in (_sup_line(r) for r in rows) if s]
+        if rendered:
+            lines.append(f"{_SUP_LABELS.get(key, key.replace('_', ' ').capitalize())}: "
+                         + "; ".join(rendered))
+    if not lines:
+        return ""
+    return ("COMPUTED FACTS (derived in SQL over the full matching set, not just "
+            "CONTEXT — use these for any count/'best'/highest/lowest reasoning, "
+            "and cite the ids you name). Every college in CONTEXT ALREADY "
+            "satisfies the user's stated budget/filters — never claim any of "
+            "them exceeds the budget. A college with no tuition figure has none "
+            "recorded; that never means free:\n- " + "\n- ".join(lines) + "\n")
+
+
+_COLLEGE_TYPES = {"government": "Government", "private": "Private",
+                  "deemed": "Deemed", "public": "Public", "govt": "Government",
+                  "sarkari": "Government"}
+_PROGRAM_LEVELS = {
+    "undergraduate": "Undergraduate", "ug": "Undergraduate", "bachelor": "Undergraduate",
+    "postgraduate": "Postgraduate", "pg": "Postgraduate", "master": "Postgraduate",
+    "doctorate": "Doctorate", "phd": "Doctorate", "doctoral": "Doctorate",
+    # the ETL derives this value with a slash (courses_csv.program_level)
+    "diploma/certificate": "Diploma/Certificate", "diploma-certificate": "Diploma/Certificate",
+    "diploma": "Diploma/Certificate", "certificate": "Diploma/Certificate",
+}
 
 
 def _clean_filters(filters):
-    """Coerce router output to safe types; drop anything malformed (loudly)."""
+    """Coerce router output to the retrieval contract's types; drop anything
+    malformed (loudly). Keys must match retrieve.search()'s filter contract
+    exactly — a typo here silently widens a query instead of failing."""
     if not isinstance(filters, dict):
         if filters:
             print(f"[filter dropped] non-dict filters: {filters!r}", file=sys.stderr)
         return {}
     out = {}
-    for key in ("max_annual_fee_inr", "student_score_pct"):
+    for key in ("max_tuition_inr", "min_tuition_inr"):
         v = filters.get(key)
-        if v is not None:
-            try:
-                out[key] = int(float(v))
-            except (TypeError, ValueError):
-                print(f"[filter dropped] {key}={v!r}", file=sys.stderr)
-    if filters.get("college_type") in ("Government", "Private", "Deemed"):
-        out["college_type"] = filters["college_type"]
-    elif filters.get("college_type"):
-        print(f"[filter dropped] college_type={filters['college_type']!r}", file=sys.stderr)
+        if v is None:
+            continue
+        try:
+            v = int(float(v))
+        except (TypeError, ValueError):
+            print(f"[filter dropped] {key}={v!r}", file=sys.stderr)
+            continue
+        # A rupee-per-year bound under Rs 1,000 can only be a unit slip
+        # ("2" meaning 2 lakh). Applying it would return an empty list and
+        # tell a student no college fits their budget — the worst possible
+        # wrong answer, so it is dropped loudly instead.
+        if v < 1000:
+            print(f"[filter dropped] implausible {key}={v} (unit error?)", file=sys.stderr)
+            continue
+        out[key] = v
+    if out.get("min_tuition_inr") and out.get("max_tuition_inr") \
+            and out["min_tuition_inr"] > out["max_tuition_inr"]:
+        print(f"[filter dropped] min_tuition {out['min_tuition_inr']} > max "
+              f"{out['max_tuition_inr']}", file=sys.stderr)
+        out.pop("min_tuition_inr")
+
+    ctype = filters.get("college_type")
+    if isinstance(ctype, str) and ctype.strip().lower() in _COLLEGE_TYPES:
+        out["college_type"] = _COLLEGE_TYPES[ctype.strip().lower()]
+    elif ctype:
+        print(f"[filter dropped] college_type={ctype!r}", file=sys.stderr)
+
+    level = filters.get("program_level")
+    if isinstance(level, str) and level.strip().lower() in _PROGRAM_LEVELS:
+        out["program_level"] = _PROGRAM_LEVELS[level.strip().lower()]
+    elif level:
+        print(f"[filter dropped] program_level={level!r}", file=sys.stderr)
+
     if filters.get("hostel_required") is True:
         out["hostel_required"] = True
-    if isinstance(filters.get("city"), str) and filters["city"].strip():
-        out["city"] = filters["city"].strip()
+    if filters.get("include_abroad") is True:
+        out["include_abroad"] = True
+    for key in ("state", "city", "entrance_exam"):
+        v = filters.get(key)
+        if isinstance(v, str) and v.strip():
+            out[key] = v.strip()
+        elif v:
+            print(f"[filter dropped] {key}={v!r}", file=sys.stderr)
+    terms = filters.get("course_terms")
+    if isinstance(terms, list):
+        terms = [t.strip() for t in terms if isinstance(t, str) and t.strip()]
+        if terms:
+            out["course_terms"] = terms
+    elif terms:
+        print(f"[filter dropped] course_terms={terms!r}", file=sys.stderr)
     return out
 
 
@@ -530,56 +747,136 @@ def _has_token(text_ws, token):
     return re.search(rf"\b{re.escape(_norm(token))}\b", text_ws) is not None
 
 
-def _literal_programs(question, rows_by_id):
-    """Program tokens from the dataset that the question literally names.
+# render_card writes "Courses offered (12): BTech; MBA; ... (+3 more)."
+_COURSE_LINE_RE = re.compile(r"^Courses offered \(\d+\):\s*(.*)$", re.M)
 
-    Tokens come from each courses_offered entry + its leading word ("MBA",
-    "B.Tech", "Diploma"). Matching is word-boundary and dot/space-insensitive
-    ("btech" == "B.Tech"; "hill blocks" can never produce "llb")."""
+
+def _card_courses(card):
+    """(course tokens, truncated?) from a card's course line.
+
+    `truncated` matters: render_card caps the list at 28 titles, so a college
+    whose line ends in "(+N more)" may well offer a program the card does not
+    show. Asserting absence against a truncated list would block correct
+    answers, which is why every absence check below is gated on it."""
+    m = _COURSE_LINE_RE.search(card or "")
+    if not m:
+        return set(), True  # no course line at all: treat as unknown, not empty
+    body = m.group(1)
+    truncated = "more)" in body
+    body = re.sub(r"\(\+\d+ more\)\.?$", "", body).strip().rstrip(".")
     tokens = set()
-    for r in rows_by_id.values():
-        for tok in r["courses_offered"].split(";"):
-            tok = tok.strip()
-            if tok:
-                tokens.add(tok)
-                tokens.add(tok.split()[0])
+    for part in body.split(";"):
+        part = part.strip()
+        if part:
+            tokens.add(part)
+            tokens.add(part.split()[0])
+    return tokens, truncated
+
+
+# A "program" the student can be held to exactly: a degree-shaped token, not a
+# broad field word. "engineering colleges" is a semantic ask and must never be
+# turned into an exact-match assertion; "LLB" or "B.Pharm" must.
+_DEGREE_TOKEN_RE = re.compile(
+    r"^(?:b|m|d)\.?[a-z]{1,5}$"
+    r"|^(?:mbbs|bds|bams|bhms|bpt|bsn|llb|llm|mba|pgdm|mca|bca|bba|bcom|bsc|"
+    r"btech|mtech|msc|mcom|gnm|anm|phd|iti|diploma)$", re.I)
+
+
+def _named_programs(question, course_terms, cards):
+    """Degree-shaped programs the question literally names AND that at least
+    one retrieved card actually lists.
+
+    Both conditions matter: the router can over-extract ("engineering"), and a
+    token no card lists gives the check nothing to verify against."""
     q_ws = _norm_ws(re.sub(r"[.\-]", "", question))
-    return [t for t in tokens if len(_norm(t)) >= 3 and _has_token(q_ws, t)]
+    vocab = set()
+    for card in cards:
+        toks, _ = _card_courses(card)
+        vocab |= {_norm(t) for t in toks}
+    named = []
+    for t in course_terms or []:
+        if not _DEGREE_TOKEN_RE.match(t.strip()) or len(_norm(t)) < 3:
+            continue
+        if _has_token(q_ws, t) and _norm(t) in vocab:
+            named.append(t)
+    return named
 
 
-def _offers(r, token):
-    return _has_token(_norm_ws(re.sub(r"[.\-]", "", r["courses_offered"])), token)
+def _offers(card, token):
+    """Card-only check — abbreviations only, so a MISS proves nothing.
+
+    Kept for the cheap positive case ("MBA" really is in the card's list). Any
+    caller acting on a NEGATIVE must use _offers_authoritative instead: the
+    card holds deduped degree abbreviations, so field words like "nursing" or
+    "engineering" are absent from it even when the college plainly offers them.
+    """
+    toks, _ = _card_courses(card)
+    hay = _norm_ws(re.sub(r"[.\-]", "", " ; ".join(toks)))
+    return _has_token(hay, token)
 
 
-def _course_violations(result, question, rows_by_id):
-    """Code-level exact-match check for course questions — no router involved.
+def _offers_authoritative(college_ids, token):
+    """Set of ids that genuinely offer `token`, asked the same way retrieval
+    asked it (title OR full_name in SQL). Falls back to the card check only if
+    the store is unreachable, so a transient DB problem degrades to the old
+    behaviour rather than erroring a student's answer."""
+    try:
+        from .retrieve import offers_program
 
-    If the user's question literally names a program, every cited college must
-    list it. Semantic asks ("engineering colleges") name no program token, so
-    policy behaviour like diploma-with-disclosure is untouched."""
+        return offers_program(list(college_ids), token)
+    except Exception as exc:  # noqa: BLE001
+        print(f"[pipeline] offers_program unavailable ({exc}); card fallback",
+              file=sys.stderr)
+        return None
+
+
+def _course_violations(result, question, hits_by_id, course_terms):
+    """Code-level exact-match check for course questions — no router verdict
+    involved. If the user's question literally names a program, every cited
+    college must list it. Colleges whose card course list is truncated are
+    skipped: their absence of the program is unproven, and blocking a correct
+    answer is worse than missing a rare wrong one."""
     if not result.get("answered"):
         return []
-    named = _literal_programs(question, rows_by_id)
+    named = _named_programs(question, course_terms,
+                            [h.get("card", "") for h in hits_by_id.values()])
     if not named:
         return []
     problems = []
     for cid in result.get("citations", []):
-        r = rows_by_id.get(cid)
-        courses_ws = _norm_ws(re.sub(r"[.\-]", "", r["courses_offered"])) if r else ""
-        if r and not any(_has_token(courses_ws, t) for t in named):
+        h = hits_by_id.get(cid)
+        if not h:
+            continue
+        _, truncated = _card_courses(h.get("card", ""))
+        if truncated:
+            continue
+        if not any(_offers(h.get("card", ""), t) for t in named):
             problems.append(
-                f"{cid} ({r['name']}) does not list {'/'.join(sorted(named))} in "
-                f"its courses_offered — remove it from the answer: a college may "
-                f"only be cited for a course question if it offers that course")
+                f"{h.get('name')} ({h.get('city')}) does not list "
+                f"{'/'.join(sorted(named))} among its courses — remove it from the "
+                f"answer: a college may only be cited for a course question if it "
+                f"offers that course")
     return problems
 
 
-def _resolve_list_selection(question, history, all_rows):
-    """If the message picks an item ('1', '2 wala...') from the counsellor's
-    MOST RECENT numbered list, resolve it in code — models grab the wrong
-    (earlier) list when several are in the history window.
+def _list_items(history):
+    """{n: item text} from the counsellor's MOST RECENT numbered list."""
+    for msg in reversed(history or []):
+        if not (isinstance(msg, dict) and msg.get("role") == "assistant"):
+            continue
+        items = dict(re.findall(r"(?:^|\n)\s*(\d{1,2})\.\s*([^\n]+)",
+                                str(msg.get("content", ""))))
+        if items:
+            return items
+    return {}
 
-    Returns the matched college row, or None."""
+
+def _selected_item_text(question, history):
+    """The text of the list item the student just picked ('2', '2 wala...').
+
+    Resolved from the conversation BEFORE retrieval, because the item text
+    (name + city) is the only usable retrieval query — embedding the bare
+    message "2" against 35k colleges returns noise."""
     if not history:
         return None
     m = re.match(r"^\s*(\d{1,2})\b", question)
@@ -592,40 +889,16 @@ def _resolve_list_selection(question, history, all_rows):
                            r"|colleges|options|compare|list|which|kaun|kitne|how many",
                            question, re.I):
         return None
-    for msg in reversed(history):
-        if not (isinstance(msg, dict) and msg.get("role") == "assistant"):
-            continue
-        items = dict(re.findall(r"(?:^|\n)\s*(\d{1,2})\.\s*([^\n]+)",
-                                str(msg.get("content", ""))))
-        if not items:
-            continue  # keep scanning for the latest message that HAS a list
-        text = items.get(str(n), "")
-        for r in all_rows:
-            if _norm(r["name"]) in _norm(text):
-                return r
-        return None  # latest list found but item didn't name a college
+    return _list_items(history).get(str(n))
+
+
+def _match_hit(text, hits):
+    """The retrieved college whose name appears in `text`, longest name first
+    so 'X Institute of Technology' beats a bare 'X'."""
+    for h in sorted(hits, key=lambda h: -len(h.get("name") or "")):
+        if h.get("name") and _norm(h["name"]) in _norm(text):
+            return h
     return None
-
-
-def _resolve_list_items(history, all_rows):
-    """All college rows named in the counsellor's most recent numbered list."""
-    if not history:
-        return []
-    for msg in reversed(history):
-        if not (isinstance(msg, dict) and msg.get("role") == "assistant"):
-            continue
-        items = re.findall(r"(?:^|\n)\s*\d{1,2}\.\s*([^\n]+)",
-                           str(msg.get("content", "")))
-        if not items:
-            continue
-        rows = []
-        for text in items:
-            for r in all_rows:
-                if _norm(r["name"]) in _norm(text):
-                    rows.append(r)
-                    break
-        return rows
-    return []
 
 
 _HINGLISH_WORDS = re.compile(
@@ -700,108 +973,183 @@ def _voice_violations(result):
     return []
 
 
-_MONEY_RE = re.compile(r"(?:rs\.?|₹|inr)\s*([\d][\d,]{3,})", re.I)
-_LPA_RE = re.compile(r"(\d+(?:\.\d+)?)\s*lpa", re.I)
-# cutoff / seats / year are matched ONLY when tied to their label, so a
-# student's own "78%" or a career "next 5 years" never gets checked as a fact.
-_CUTOFF_RE = re.compile(r"(\d{1,2})\s*%\s*(?:aggregate|cut[- ]?off)"
-                        r"|cut[- ]?off\s*(?:of|is|was|:)?\s*(\d{1,2})\s*%", re.I)
-_SEATS_RE = re.compile(r"(\d{2,4})\s*(?:total\s+)?seats", re.I)
-_YEAR_RE = re.compile(r"(?:established|founded)\s*(?:in)?\s*(\d{4})", re.I)
+# Matches a rupee figure AND the bare upper bound of a range. The prompt asks
+# for fee ranges ("Rs 45,000-Rs 1,80,000", and models freely write
+# "Rs 45,000-1,80,000"), so a currency-prefixed-only pattern verified the lower
+# bound and let the upper one through unchecked — the half of the range a
+# budget-conscious student actually acts on.
+_MONEY_RE = re.compile(
+    r"(?:rs\.?|₹|inr)\s*([\d][\d,]{3,})"
+    r"|(?<=[\d])\s*(?:-|–|—|to)\s*(?:rs\.?|₹|inr)?\s*([\d][\d,]{3,})",
+    re.I)
+# year and course-count are matched ONLY when tied to their label, so a
+# career "next 5 years" never gets checked as a stated fact.
+_YEAR_RE = re.compile(r"(?:established|founded|est\.)\s*(?:in)?\s*(\d{4})", re.I)
+# Comma-aware on purpose: "1,284 courses" must not be read as "284 courses"
+# and then flagged as invented.
+_NCOURSES_RE = re.compile(
+    r"(\d[\d,]{0,7})\s+(?:different\s+)?(?:courses|programmes|programs)\b", re.I)
 
 
-def _numeric_violations(result, all_rows, ignore_money=None):
-    """Every hard number in the answer that names a college fact — tuition,
-    placement, cutoff, seats, founding year — must trace to a CITED college's
-    actual field, checked against the data itself, not the model's word.
-    Numbers are exactly where a wrong answer destroys trust and where LLMs are
-    least reliable, so a stated figure that matches no cited record is blocked
-    and regenerated. Each number is matched only in a form clearly attributed
-    to that field ('82% cutoff', '420 seats', 'established in 2007'), so a
-    student's own score ('I got 78%') or a conversational figure ('next 5
-    years') is never mistaken for a fact-claim."""
+def _ints(text):
+    """Every integer written in a piece of grounded text, comma-insensitive.
+
+    ObjectIds are removed first: their timestamp prefix is often eight digits,
+    and letting those into the allowed-number set would quietly widen the
+    money check by a handful of arbitrary values."""
+    text = CID_RE.sub(" ", text or "")
+    return {int(m.replace(",", "")) for m in re.findall(r"\d[\d,]*", text)}
+
+
+# A ranking claim: "#72 in Engineering", "NIRF 2025 rank 3", "ranked 12th".
+_RANK_CLAIM_RE = re.compile(
+    r"(?:nirf[^.\n]{0,40}?(?:rank(?:ed|ing)?)?\s*#?\s*(\d{1,4})"
+    r"|#\s*(\d{1,4})\s*(?:in|for|among)\b"
+    r"|rank(?:ed|ing)?\s*#?\s*(\d{1,4})(?:st|nd|rd|th)?\b)", re.I)
+
+
+def _rank_violations(result, hits_by_id):
+    """A ranking the answer states must appear on a CITED college's card.
+
+    This exists because of a live failure: asked for the best engineering
+    colleges, MIVI reported "IIT Bhilai ranked #72 in Engineering by NIRF 2025"
+    for a college with zero registry facts and no NIRF line on its card — and
+    the year was wrong too, since only 2024 was ingested. The general integer
+    check could not catch it: 72 is small enough to occur incidentally in a
+    card, so it counted as "seen".
+
+    A ranking is exactly the kind of claim a student acts on and cannot easily
+    disprove, so it is verified against the rendered ranking lines specifically
+    rather than against any number that happens to appear.
+    """
     if not result.get("answered"):
         return []
-    cited = [r for r in all_rows if r["college_id"] in set(result.get("citations", []))]
+    answer = result.get("answer", "")
+    claims = {int(next(g for g in m.groups() if g))
+              for m in _RANK_CLAIM_RE.finditer(answer)}
+    if not claims:
+        return []
+
+    cited = [hits_by_id[c] for c in result.get("citations", []) if c in hits_by_id]
+    allowed: set[int] = set()
+    for h in cited:
+        for line in str(h.get("card", "")).split("\n"):
+            if "NIRF" in line or "rank" in line.lower():
+                allowed |= {int(n) for n in re.findall(r"\d{1,4}", line)}
+
+    bad = sorted(claims - allowed)
+    if not bad:
+        return []
+    return [f"the answer states rank(s) {bad} but no cited college's record "
+            f"carries that ranking — remove the ranking entirely rather than "
+            f"guessing it; we only hold NIRF ranks for a minority of colleges"]
+
+
+def _numeric_violations(result, hits_by_id, extra_ok=None):
+    """Every hard number in the answer that names a college fact — tuition,
+    founding year, course count — must trace back to a CITED college's own
+    card, checked against the data itself, not the model's word.
+
+    The allowed set is exactly the integers that appear in the cited cards
+    (plus code-computed facts we injected, and per-semester conversions of the
+    tuition figures). The card IS what the model was shown, so this is the
+    tightest possible rule that still lets it quote a hostel fee or a figure
+    from the About text. Numbers are exactly where a wrong answer destroys
+    trust and where LLMs are least reliable, so a stated figure that matches
+    nothing cited is blocked and regenerated.
+
+    Cutoff, seat-count and placement-LPA checks are deliberately absent: this
+    corpus has no such columns, so there is nothing to check them against and
+    asserting them would reject valid answers. Rule 5 of the generator prompt
+    forbids stating those numbers at all.
+
+    RANKINGS are checked separately and strictly (see _rank_violations): they
+    DO have a source now, and the general integer test is too weak for them —
+    "#72" is a small number that appears incidentally in almost any card, so it
+    passed unchecked while being entirely invented."""
+    if not result.get("answered"):
+        return []
+    cited = [hits_by_id[c] for c in result.get("citations", []) if c in hits_by_id]
     if not cited:
         return []
     answer = result.get("answer", "")
-    ignore = set(ignore_money or ())
-    true_fees = {r["annual_fees_inr"] for r in cited}
-    # allow per-semester conversions (fee/2) and the student's own budget number
-    fee_ok = true_fees | {f * 2 for f in true_fees} | {f // 2 for f in true_fees} | ignore
-    true_lpa = {round(r["avg_placement_lpa"], 1) for r in cited if r["avg_placement_lpa"] > 0}
-    true_cutoffs = {r["last_year_cutoff_pct"] for r in cited}
-    true_seats = {r["total_seats"] for r in cited}
-    true_years = {r["established_year"] for r in cited}
+
+    allowed = set(extra_ok or ())
+    fees, years, counts = set(), set(), set()
+    for h in cited:
+        allowed |= _ints(h.get("card", ""))
+        for key in ("min_tuition_inr", "max_tuition_inr"):
+            v = h.get(key)
+            if v:
+                fees.add(int(v))
+        if h.get("n_courses"):
+            counts.add(int(h["n_courses"]))
+        m = re.search(r"^Established:\s*(\d{4})", h.get("card", ""), re.M)
+        if m:  # establish_year is not in the retrieval hit; the card is
+            years.add(int(m.group(1)))
+    # per-semester / per-year restatements of a real tuition figure are honest
+    allowed |= fees | {f * 2 for f in fees} | {f // 2 for f in fees} | counts | years
 
     problems = []
     for m in _MONEY_RE.finditer(answer):
-        val = int(m.group(1).replace(",", ""))
-        if val >= 10000 and val not in fee_ok:
+        # group 1 = currency-prefixed figure, group 2 = the bare upper bound of
+        # a range ("Rs 45,000-1,80,000"). Exactly one of them matches.
+        val = int((m.group(1) or m.group(2)).replace(",", ""))
+        if val not in allowed:
             problems.append(
-                f"answer states Rs {val:,}, which is not the tuition of any cited "
-                f"college (real fees: {sorted(true_fees)}) — correct it or drop it")
-    for m in _LPA_RE.finditer(answer):
-        val = round(float(m.group(1)), 1)
-        # Checked even when NO cited college reports a figure — in that case
-        # any stated LPA is by definition invented (e.g. a number for the
-        # medical college whose placement is "not reported").
-        if val not in true_lpa:
-            problems.append(
-                f"answer states {val} LPA, which is not the placement of any cited "
-                f"college (real: {sorted(true_lpa) or 'none reported'}) — correct it or drop it")
-    for m in _CUTOFF_RE.finditer(answer):
-        val = int(m.group(1) or m.group(2))
-        if val not in true_cutoffs:
-            problems.append(
-                f"answer states a {val}% cutoff, which matches no cited college "
-                f"(real cutoffs: {sorted(true_cutoffs)}) — correct it or drop it")
-    for m in _SEATS_RE.finditer(answer):
-        val = int(m.group(1))
-        if val not in true_seats:
-            problems.append(
-                f"answer states {val} seats, which matches no cited college "
-                f"(real: {sorted(true_seats)}) — correct it or drop it")
+                f"answer states Rs {val:,}, which appears nowhere in the cited "
+                f"colleges' listings (their tuition figures: "
+                f"{sorted(fees) or 'none recorded'}) — correct it or drop it")
     for m in _YEAR_RE.finditer(answer):
         val = int(m.group(1))
-        if val not in true_years:
+        if val not in allowed:
             problems.append(
                 f"answer says established {val}, which matches no cited college "
-                f"(real: {sorted(true_years)}) — correct it or drop it")
+                f"(real: {sorted(years) or 'none recorded'}) — correct it or drop it")
+    for m in _NCOURSES_RE.finditer(answer):
+        val = int(m.group(1).replace(",", ""))
+        if val not in allowed:
+            problems.append(
+                f"answer states {val} courses, which matches no cited college "
+                f"(real: {sorted(counts) or 'none recorded'}) — correct it or drop it")
     return problems
 
 
-def _name_violations(result, all_rows, context_ids):
-    """Every college NAMED in the prose must be backed by a citation.
+def _name_violations(result, hits):
+    """Every retrieved college NAMED in the prose must be backed by a citation.
 
     Catches the citation-dodge failure mode: the model drops a flagged id from
-    `citations` but leaves the college in the text with a disclaimer."""
+    `citations` but leaves the college in the text with a disclaimer.
+
+    Scope is the retrieved hits only. The old version scanned the whole corpus
+    to also catch names that were never in CONTEXT; at ~35,300 colleges that
+    scan is not affordable per answer, and a fabricated college is still caught
+    by _verify (its id can't be in CONTEXT) and by _numeric_violations (its
+    numbers can't be in a cited card)."""
     if not result.get("answer"):
         return []
     answer_norm = _norm(result["answer"])
     citations = set(result.get("citations", []))
     problems = []
-    for r in all_rows:
-        cid = r["college_id"]
-        if _norm(r["name"]) in answer_norm and cid not in citations:
-            if cid in context_ids:
-                problems.append(
-                    f"the answer names {r['name']} but {cid} is not in citations — "
-                    f"either cite it (only if it truly qualifies for the question) "
-                    f"or remove every mention of it from the answer")
-            else:
-                problems.append(
-                    f"the answer names {r['name']} which is not even in CONTEXT — "
-                    f"remove every mention of it")
+    for h in hits:
+        name = h.get("name") or ""
+        # short names ("City College") collide with ordinary prose; require a
+        # name substantial enough that a match is not a coincidence
+        if len(_norm(name)) < 12:
+            continue
+        if _norm(name) in answer_norm and h["college_id"] not in citations:
+            problems.append(
+                f"the answer names {name} ({h.get('city')}) but its id is not in "
+                f"citations — either cite it (only if it truly qualifies for the "
+                f"question) or remove every mention of it from the answer")
     return problems
 
 
 def _strip_ids(text):
-    """Ids belong in the citations array; scrub any stray codes from prose."""
-    text = re.sub(r"\s*[\(\[]\s*(?:id\s*)?C0\d{2}\s*[\)\]]", "", text)
-    text = re.sub(r"\bC0\d{2}\b\s*,\s*", "", text)   # "(C014, 63%)" -> "(63%)"
-    text = re.sub(r",?\s*\bC0\d{2}\b", "", text)
+    """Ids belong in the citations array; scrub any stray ObjectIds from prose."""
+    text = re.sub(r"\s*[\(\[]\s*(?:id\s*)?[0-9a-f]{24}\s*[\)\]]", "", text, flags=re.I)
+    text = re.sub(r"\b[0-9a-f]{24}\b\s*,\s*", "", text, flags=re.I)
+    text = re.sub(r",?\s*\b[0-9a-f]{24}\b", "", text, flags=re.I)
     text = re.sub(r"\(\s*,\s*", "(", text)           # leftover "(, ..." artifacts
     text = re.sub(r",\s*\)", ")", text)
     text = re.sub(r"\(\s*\)", "", text)
@@ -813,7 +1161,7 @@ def _format_answer(text):
     (deterministic — independent of whether the model emitted newlines).
 
     Splits only when a genuine list exists (both "1." and "2." present), so a
-    sentence that merely ends in a small number ("cutoff is 82. Hostel...")
+    sentence that merely ends in a small number ("established in 2007. Hostel...")
     is never broken apart."""
     text = _strip_ids(text)
     nums = {int(m.group(1)) for m in re.finditer(r"(?:^|\s)(\d{1,2})\.\s", text)}
@@ -904,28 +1252,111 @@ def _cache_store(key, result):
         while len(_CACHE) > _CACHE_MAX:
             _CACHE.pop(next(iter(_CACHE)))
         try:  # persist best-effort: server restarts keep their warm cache,
-              # so prewarm costs real LLM calls exactly once, ever
+              # so prewarm costs real LLM calls exactly once, ever.
+              # Stamped with the corpus build so a rebuild invalidates it —
+              # see _cache_load.
             tmp = _CACHE_FILE.with_suffix(".tmp")
-            tmp.write_text(json.dumps(_CACHE, ensure_ascii=False), encoding="utf-8")
+            tmp.write_text(
+                json.dumps({"__corpus__": _corpus_stamp(), "answers": _CACHE},
+                           ensure_ascii=False),
+                encoding="utf-8")
             tmp.replace(_CACHE_FILE)
         except Exception as e:
             print(f"[cache] persist failed: {e}", file=sys.stderr)
 
 
+def _corpus_stamp():
+    """Identity of the corpus the cached answers were produced from."""
+    try:
+        from .store.db import get_conn, get_meta
+
+        return str(get_meta(get_conn(), "built_at", "") or "")
+    except Exception:  # noqa: BLE001 - no corpus yet: treat as unknown
+        return ""
+
+
 def _cache_load():
+    """Load persisted answers, but ONLY if they came from the corpus we are
+    about to serve.
+
+    A cached answer is a frozen set of facts — fees, counts, the colleges it
+    names. The ETL republishes the whole database, so an answer cached before a
+    rebuild can cite a college that no longer exists or quote a fee that has
+    since changed, and it would be served with full confidence and no
+    retrieval. Keying the file on the corpus build stamp makes a stale cache
+    impossible rather than merely unlikely.
+    """
     if not config.CACHE_ENABLED:
         return
     try:
-        if _CACHE_FILE.exists():
-            data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
-            if isinstance(data, dict):
-                _CACHE.update(data)
-                print(f"[cache] loaded {len(data)} answers from disk", file=sys.stderr)
+        if not _CACHE_FILE.exists():
+            return
+        data = json.loads(_CACHE_FILE.read_text(encoding="utf-8"))
+        if not isinstance(data, dict):
+            return
+        stamp = _corpus_stamp()
+        if data.get("__corpus__") != stamp:
+            print("[cache] discarding on-disk answers: built from a different "
+                  "corpus than the one being served", file=sys.stderr)
+            return
+        answers = data.get("answers")
+        if isinstance(answers, dict):
+            _CACHE.update(answers)
+            print(f"[cache] loaded {len(answers)} answers from disk", file=sys.stderr)
     except Exception as e:
         print(f"[cache] load failed: {e}", file=sys.stderr)
 
 
 _cache_load()
+
+
+def _to_context(hits):
+    """CONTEXT is exactly the cards retrieval returned — render_card is the
+    single definition of what the model may see about a college, and the
+    verifier checks the answer's numbers against these same strings.
+
+    Budgeted: cards now carry web-harvested facts and long overviews, so an
+    unbounded join grows with corpus richness rather than with top_k. Trimming
+    drops whole lowest-ranked cards rather than truncating one mid-sentence —
+    a half-card would let the model read a fee that belongs to another college.
+    """
+    budget = getattr(config, "MAX_CONTEXT_CHARS", 12_000)
+    out, used = [], 0
+    for h in hits:
+        card = h.get("card")
+        if not card:
+            continue
+        if out and used + len(card) + 2 > budget:
+            break
+        out.append(card)
+        used += len(card) + 2
+    return "\n\n".join(out)
+
+
+def _search(question, filters, top_k, query_vec=None):
+    """retrieve.search with the store's failure surfaced, not swallowed."""
+    return retrieve.search(question, filters=filters or None, top_k=top_k,
+                           query_vec=query_vec)
+
+
+def _count(filters):
+    """Exact total over the whole matching set. Never fatal: an aggregate we
+    cannot compute costs a weaker prompt, not an unanswered student."""
+    try:
+        n = retrieve.count_matching(filters or None)
+        return int(n) if n is not None else None
+    except Exception as e:
+        print(f"[count_matching failed] {e}", file=sys.stderr)
+        return None
+
+
+def _superlatives(filters, limit=5):
+    try:
+        sup = retrieve.superlatives(filters or None, limit=limit)
+        return sup if isinstance(sup, dict) else {}
+    except Exception as e:
+        print(f"[superlatives failed] {e}", file=sys.stderr)
+        return {}
 
 
 def answer_question(question, history=None, known_profile=None):
@@ -976,7 +1407,7 @@ def answer_question(question, history=None, known_profile=None):
                       "retrieved": [], "verified": True,
                       "total_latency_s": round(time.perf_counter() - t_start, 3)})
         result = {"answer": "Haha, nice try! But I'm just here to help you find the "
-                            "right college — courses, fees, cutoffs, hostels, "
+                            "right college — courses, fees, hostels, entrance exams, "
                             "scholarships. What would you like to know?",
                   "citations": [], "answered": True, "reason_if_unanswered": None}
         if history is not None or known_profile is not None:
@@ -1022,7 +1453,7 @@ def answer_question(question, history=None, known_profile=None):
             [{"role": "system", "content": ROUTER_SYSTEM},
              {"role": "user", "content": f"{hist_text}CURRENT MESSAGE: {question}"}],
             model=config.FAST_MODEL, json_mode=True, temperature=0.0,
-            max_tokens=300, usage_log=calls,
+            max_tokens=400, usage_log=calls,
         )
         route_info = _parse_json(raw)
         if not isinstance(route_info, dict):
@@ -1033,9 +1464,9 @@ def answer_question(question, history=None, known_profile=None):
 
     route = route_info.get("route", "data_query")
     filters = _clean_filters(route_info.get("filters"))
-    course_terms = [t for t in (route_info.get("course_terms") or [])
-                    if isinstance(t, str)] if isinstance(route_info.get("course_terms"), list) else []
+    course_terms = filters.get("course_terms", [])
     needs_all = bool(route_info.get("needs_all_records"))
+    question_kind = route_info.get("question_kind")
     # Merge: facts the client already knew (survives history truncation) +
     # anything the router freshly extracted this turn. Client-known facts are
     # the base so a fact from turn 1 is never lost by turn 15; the router
@@ -1051,30 +1482,31 @@ def answer_question(question, history=None, known_profile=None):
     if unit_note and not re.search(r"\d|lakh|semester|year|annual|rs\b|₹", unit_note, re.I):
         unit_note = None
 
-    # Lookup questions name a specific college ("can I get into X?", "what is
-    # X's fee?") — hard-filtering by the student's score/budget would remove
-    # the very college they asked about, making an honest "no, its cutoff is
-    # higher than your score" impossible. Eligibility is computed in code and
-    # handed to the generator as facts (see ELIGIBILITY FACTS below).
-    raw_score = filters.get("student_score_pct")
-    raw_budget = filters.get("max_annual_fee_inr")  # for the numeric guardrail's
-                                                    # budget exclusion (below)
-    if route_info.get("question_kind") == "lookup":
-        filters = {}
+    raw_budget = filters.get("max_tuition_inr")  # for the numeric guardrail's
+                                                 # budget exclusion (below)
+    # Lookup questions name a specific college ("what does X cost?") — hard
+    # filters would remove the very college they asked about, making an honest
+    # "that one is above your budget" impossible. Abroad is force-INCLUDED
+    # here: a student naming a foreign institution must not be told we don't
+    # have it just because the default view is domestic.
+    if question_kind == "lookup":
+        filters = {"include_abroad": True}
 
     # "Any other college nearby?" / "something else?" means the student wants
     # to look BEYOND the current city — so the city filter must come off, not
     # stay on and produce "that's the only one here" three turns in a row.
-    broadening = bool(_BROADEN_RE.search(question))
-    if broadening and filters.get("city"):
+    if _BROADEN_RE.search(question) and filters.get("city"):
         print(f"[broaden] dropping city filter {filters['city']!r}", file=sys.stderr)
         filters.pop("city", None)
+    if _BROADEN_STATE_RE.search(question) and filters.get("state"):
+        print(f"[broaden] dropping state filter {filters['state']!r}", file=sys.stderr)
+        filters.pop("state", None)
 
     # Deterministic guard: marks/budget statements are counselling openers,
     # never smalltalk — small routers occasionally misfile them.
     if route == "smalltalk" and re.search(r"\d+\s*%|\blakh\b|budget|marks|score|percent", question, re.I):
         route = "data_query"
-        route_info["question_kind"] = "profile_share"
+        question_kind = "profile_share"
 
     # ---- 2a. Non-data routes skip retrieval AND the big model entirely -----
     _GREETING_TONES = [
@@ -1108,7 +1540,7 @@ def answer_question(question, history=None, known_profile=None):
             "citations": [],
             "answered": route == "smalltalk",
             "reason_if_unanswered": None if route == "smalltalk"
-            else "Out of scope: I only answer questions about the colleges in the dataset.",
+            else "Out of scope: I only answer questions about colleges and admissions.",
         }
         _log_metrics({"question": question, "route": route, "calls": calls,
                       "retrieved": [], "verified": True,
@@ -1122,127 +1554,254 @@ def answer_question(question, history=None, known_profile=None):
         return result
 
     # ---- 2b. Hybrid retrieval ----------------------------------------------
-    # Superlatives/counts need the full dataset in view: with only 15 records
-    # the honest fix is to widen k to all of them, not to let top-k truncation
-    # produce a confidently wrong "cheapest college".
-    top_k = 15 if needs_all else config.TOP_K
+    default_k = int(getattr(config, "TOP_K", 12) or 12)
+    # Aggregate questions get a wider shortlist, NOT the corpus: the count and
+    # the superlatives come from SQL below, and the extra cards only give the
+    # shown list room to be ranked and trimmed.
+    top_k = min(default_k * 2, 24) if needs_all else default_k
+
+    # A bare "2" or "compare these two" carries no retrievable signal against
+    # 35k colleges — resolve the referent from the counsellor's last numbered
+    # list FIRST and retrieve on that text instead.
+    picked_text = _selected_item_text(question, history)
+    compare_texts = []
+    if not picked_text and history and re.search(
+            r"compare|tulna|difference|versus|\bvs\b|फ़?र्क|अंतर", question, re.I):
+        compare_texts = list(_list_items(history).values())[:4]
+    search_query = question
+    if picked_text:
+        search_query = picked_text
+    elif compare_texts:
+        search_query = " | ".join(compare_texts)
+
     qv = prefetch.result()  # computed concurrently with the router call above
-    all_rows = load_colleges()
-    results = retrieve(question, filters=filters, course_terms=course_terms,
-                       top_k=top_k, query_vec=qv)
-    relaxed_note = ""
-    if not results and any(filters.values() if filters else []):
-        # Zero matches must not dead-end the student: relax the filters so the
-        # counsellor can show the nearest real options — honestly labelled.
-        stated = {k: v for k, v in filters.items() if v}
-        results = retrieve(question, filters=None, course_terms=course_terms,
-                           top_k=15, query_vec=qv)
+    if search_query is not question:
+        qv = None  # the prefetched vector embeds the wrong text; re-encode
+    hits = _search(search_query, filters, top_k, query_vec=qv)
+
+    # ---- Self-RAG: repair retrieval BEFORE falling back to blunt relaxation --
+    # Ordering is the point. The relaxation below rescues a dead end by DROPPING
+    # the student's constraints, which answers a different question than the one
+    # asked. A targeted repair — "Vizag" is spelled "Visakhapatnam", the level
+    # filter was never stated — answers the SAME question correctly, so it has
+    # to get first refusal. Gated on cheap code signals (see selfrag.needs_repair)
+    # so an ordinary query never pays for the extra model call.
+    repair_note = ""
+    try:
+        signal = selfrag.needs_repair(hits, filters, len(hits), question_kind)
+        if signal:
+            verdict = selfrag.grade(question, filters, _count(filters), signal, calls)
+            repaired = selfrag.apply_repair(filters, verdict)
+            if repaired:
+                new_filters, what = repaired
+                new_hits = _search(search_query, new_filters, top_k, query_vec=qv)
+                # Only adopt a repair that actually helped. A relaxation that
+                # returns the same nothing has cost latency and changed the
+                # question for no gain, so it is discarded.
+                if len(new_hits) > len(hits):
+                    print(f"[selfrag] {signal}: {what} "
+                          f"({len(hits)} -> {len(new_hits)} hits)", file=sys.stderr)
+                    hits, filters = new_hits, new_filters
+                    repair_note = selfrag.context_note(what, verdict)
+    except Exception as exc:  # noqa: BLE001 - never let the critic break an answer
+        print(f"[selfrag] skipped: {exc}", file=sys.stderr)
+
+    relaxed_note = repair_note
+    stated = {k: v for k, v in filters.items() if v and k != "include_abroad"}
+    if not hits and stated:
+        # Zero matches must not dead-end the student. Relax in two steps so the
+        # subject of the question survives as long as possible: keep the course
+        # /level the student cares about, drop the money and geography first.
+        keep = {k: v for k, v in filters.items()
+                if k in ("course_terms", "program_level", "include_abroad")}
+        hits = _search(search_query, keep, top_k, query_vec=qv)
+        if not hits:
+            hits = _search(search_query, None, top_k, query_vec=qv)
         relaxed_note += (
-            f"ZERO MATCHES: no listed college satisfies the stated constraints "
-            f"{json.dumps(stated)}. Counsel honestly, never dead-end: say plainly "
-            f"that none of the colleges we work with met these constraints last "
-            f"year (e.g. every cutoff is above the student's score), then present "
-            f"the 2-3 NEAREST options as future targets with their real numbers "
-            f"(lowest cutoffs / closest fees), and one encouraging line about the "
-            f"path forward. NEVER present any college as currently meeting the "
-            f"stated constraints.\n")
-        filters = {}
+            f"ZERO MATCHES: no college in the catalogue satisfies the stated "
+            f"constraints {json.dumps(stated)}. Counsel honestly, never dead-end: "
+            f"say plainly that nothing matched these exact constraints, then "
+            f"present the 2-3 NEAREST options below as realistic alternatives "
+            f"with their real numbers, name which constraint each one misses, "
+            f"and add one encouraging line about the path forward. NEVER present "
+            f"any college as currently meeting the stated constraints.\n")
+        filters = {k: v for k, v in filters.items() if k == "include_abroad"}
+
     # A named program must never be DENIED just because the student's own
-    # filters (score/budget) removed every college that offers it. Live-tested
-    # failure: "kya main LLB kar sakta hoon? mere 70% hain" -> the 70% filter
-    # dropped Haldwani Law College (cutoff 74), the only LLB provider, and the
-    # model honestly-but-wrongly said no college offers LLB. Detect the
-    # conflict in code, widen the context, hand the model the honest framing.
-    stated_now = {k: v for k, v in (filters or {}).items() if v}
-    if stated_now and results:
-        # The program can come from the CURRENT question ("can I do LLB?") or
-        # from the running profile ("...LLB..." three turns ago, now just
-        # "which colleges are nearby?"). Live-tested failure: the follow-up
-        # question named no program, so this guard stayed silent and the model
-        # said "we don't have any LLB programs" — contradicting its own
-        # earlier, correct answer.
-        prog_text = question + " " + str(
-            (merged_profile or {}).get("field_interest") or "")
-        named_prog = _literal_programs(prog_text, {r["college_id"]: r for r in all_rows})
-        ctx_rows = [r for r, _ in results]
-        missing = [t for t in named_prog
-                   if not any(_offers(r, t) for r in ctx_rows)]
-        offering = {t: [r for r in all_rows if _offers(r, t)] for t in missing}
-        offering = {t: rs for t, rs in offering.items() if rs}
-        if offering:
-            results = retrieve(question, filters=None, course_terms=course_terms,
-                               top_k=15, query_vec=qv)
-            lines = []
-            for t, rs in offering.items():
-                lines.append(f"{t}: " + "; ".join(
-                    f"{r['college_id']} {r['name']}, {r['city']} "
-                    f"(cutoff {r['last_year_cutoff_pct']}%, Rs {r['annual_fees_inr']:,}/yr)"
-                    for r in rs))
-            relaxed_note += (
-                "PROGRAM vs FILTER CONFLICT (computed in code): the asked program IS "
-                "offered, but every college offering it failed the student's stated "
-                f"constraints {json.dumps(stated_now)}. The colleges that DO offer it:\n- "
-                + "\n- ".join(lines) +
-                "\nAnswer honestly: NEVER say the program is not offered. Name these "
-                "colleges with their real numbers, state plainly which constraint they "
-                "miss (e.g. cutoff above the student's score — give both numbers), and "
-                "add one encouraging line about the path forward (a compartment/"
-                "improvement exam, or streams that do fit the constraints).\n")
-            filters = {}
-    context_ids = {r["college_id"] for r, _ in results}
-    context = to_context(results) if results else "(no colleges matched the hard filters)"
+    # budget/location filters removed every college that offers it. Live-tested
+    # failure on the old corpus: "kya main LLB kar sakta hoon?" + a budget
+    # filter dropped every law college, and the model honestly-but-wrongly said
+    # no college offers LLB. At this scale the check is a SQL count, not a scan:
+    # ask how many colleges offer the program with the money/geography removed.
+    stated_now = {k: v for k, v in filters.items() if v and k != "include_abroad"}
+    if hits and course_terms and stated_now:
+        # The "does any retrieved college offer this?" test MUST be asked the
+        # way retrieval asked it (title OR full_name in SQL). Reading the card
+        # instead is what made this branch misfire on every field-word term:
+        # cards list abbreviations ("BSc; MD; MS"), so "nursing" looked absent
+        # from colleges that plainly offer a Bachelor of Science in Nursing,
+        # and the student's own state/budget filters were then thrown away and
+        # replaced with a nationwide search plus a false "none of them
+        # satisfied your constraints" note.
+        hit_ids = [h["college_id"] for h in hits]
+        missing = []
+        for t in course_terms:
+            offering = _offers_authoritative(hit_ids, t)
+            if offering is None:  # store unreachable: fall back to the card
+                offering = {h["college_id"] for h in hits
+                            if _offers(h.get("card", ""), t)}
+            if not offering:
+                missing.append(t)
+        if missing:
+            course_only = {"course_terms": missing}
+            if filters.get("include_abroad"):
+                course_only["include_abroad"] = True
+            n_offering = _count(course_only)
+            if n_offering:
+                hits = _search(" ".join(missing) + " " + question, course_only,
+                               top_k, query_vec=None)
+                relaxed_note += (
+                    f"PROGRAM vs FILTER CONFLICT (counted in SQL): "
+                    f"{n_offering:,} colleges DO offer {', '.join(missing)}, but none "
+                    f"of them satisfied the student's other constraints "
+                    f"{json.dumps(stated_now)}. CONTEXT now holds colleges that offer "
+                    f"the program WITHOUT those constraints. Answer honestly: NEVER "
+                    f"say the program is not offered. Give the real total, name a few "
+                    f"of these colleges with their real numbers, state plainly which "
+                    f"constraint they miss (give both numbers), and add one "
+                    f"encouraging line about the path forward.\n")
+                filters = course_only
+
+    context_ids = {h["college_id"] for h in hits}
+    hits_by_id = {h["college_id"]: h for h in hits}
+    context = _to_context(hits) if hits else "(no colleges matched the hard filters)"
+
+    # Every code-computed block is also collected here: the numeric verifier
+    # must accept figures the model correctly repeats back from OUR arithmetic
+    # (totals, superlative fees) as well as from the cited cards.
+    code_notes = [relaxed_note]
+
+    def note(text):
+        code_notes.append(text)
+        return text
 
     user_msg = hist_text + f"CONTEXT:\n{context}\n\n"
     if relaxed_note:
         user_msg += relaxed_note
+
+    # ---- 2c. SQL aggregates: counts and superlatives ------------------------
+    total = None
+    if hits and (needs_all or question_kind in ("enumerate", "recommend")):
+        total = _count(filters)
+        # Superlatives are computed for recommendations too, not just
+        # needs_all: "which is the best engineering college" is a recommend,
+        # and it is exactly the question that needs the ranking.
+        sup = _superlatives(filters, limit=5) if (
+            needs_all or question_kind == "recommend") else {}
+
+        # A superlative names colleges drawn from the WHOLE matching population,
+        # which retrieval's top-k usually does not contain. Printing their ids in
+        # COMPUTED FACTS while they are absent from CONTEXT is a trap: the model
+        # is told to cite what it names, the verifier rejects ids that were never
+        # retrieved, and the answer degrades to whatever happened to be in the
+        # top-k instead. Observed live — "best engineering colleges in India"
+        # returned five arbitrary private colleges while IIT Madras sat in the
+        # NIRF block unciteable.
+        #
+        # So the superlative colleges are RETRIEVED and appended to the context
+        # they are quoted in. Capped, and existing hits keep their order — this
+        # adds the answer to the question actually asked, it does not reorder
+        # everything else.
+        extra_ids: list[str] = []
+        for rows in sup.values():
+            for row in (rows or []):
+                cid = row.get("college_id")
+                if cid and cid not in hits_by_id and cid not in extra_ids:
+                    extra_ids.append(cid)
+        if extra_ids:
+            try:
+                added = retrieve.hydrate_ids(extra_ids[:8])
+                for h in added:
+                    hits.append(h)
+                    hits_by_id[h["college_id"]] = h
+                    context_ids.add(h["college_id"])
+                if added:
+                    context = _to_context(hits)
+                    user_msg = hist_text + f"CONTEXT:\n{context}\n\n"
+                    if relaxed_note:
+                        user_msg += relaxed_note
+                    print(f"[pipeline] added {len(added)} superlative colleges "
+                          f"to CONTEXT so they can be cited", file=sys.stderr)
+            except Exception as exc:  # noqa: BLE001
+                print(f"[pipeline] could not hydrate superlatives: {exc}",
+                      file=sys.stderr)
+
+        facts = _computed_facts(hits, sup, total)
+        if facts:
+            user_msg += note(facts)
+
+    want_n = _requested_count(question)
+    if total is not None and hits:
+        if total > len(hits):
+            show_n = want_n or min(len(hits), 10)
+            user_msg += note(
+                f"TOTAL MATCHES: {total:,} colleges match the applied filters; "
+                f"CONTEXT holds only the top {len(hits)}. Lead with the exact total "
+                f"({total:,}), then show at most {show_n} of them and say more are "
+                f"available and you can narrow them down. It is FORBIDDEN to imply "
+                f"the shown colleges are the only ones that qualify.\n")
+        else:
+            user_msg += note(
+                f"TOTAL MATCHES: {total:,} — CONTEXT holds ALL of them, so an "
+                f"enumeration here can and must be complete: name every qualifying "
+                f"college and cite every one you name.\n")
+
     negated = re.search(r"\b(not|no|without|don'?t|doesn'?t|nahi|nahin|नहीं|बिना)\b",
                         question, re.I)
-    if results and (needs_all or route_info.get("question_kind") == "recommend"):
-        user_msg += _computed_facts([r for r, _ in results])
-    if negated and results:
-        # complement sets are computed in code — negated enumerations must be
-        # complete, and models reliably under-count them
-        rows_ctx0 = {r["college_id"]: r for r, _ in results}
-        for t in _literal_programs(question, rows_ctx0)[:2]:
-            non = [cid for cid in sorted(rows_ctx0) if not _offers(rows_ctx0[cid], t)]
-            if non:
-                user_msg += (f"NEGATION FACTS (computed in code): colleges NOT "
-                             f"offering {t}: {', '.join(non)} — a complete "
-                             f"'not offering' answer lists ALL of these.\n")
-        if re.search(r"hostel|हॉस्टल", question, re.I):
-            non = [cid for cid in sorted(rows_ctx0)
-                   if rows_ctx0[cid]["hostel_available"].strip().lower() == "no"]
-            if non:
-                user_msg += (f"NEGATION FACTS (computed in code): colleges WITHOUT "
-                             f"hostel: {', '.join(non)}.\n")
-    if raw_score is not None and results:
-        # Models mis-compare numbers ("78 is above 82") — verdicts come from code.
-        verdicts = "; ".join(
-            f"{r['college_id']} cutoff {r['last_year_cutoff_pct']}% -> "
-            + ("ELIGIBLE" if raw_score >= r["last_year_cutoff_pct"] else "NOT eligible")
-            for r, _ in results)
-        user_msg += (f"ELIGIBILITY FACTS (computed in code from the student's score "
-                     f"of {raw_score}%): {verdicts}. Use these verdicts verbatim — "
-                     f"never recompute them yourself.\n")
-    selected = _resolve_list_selection(question, history, all_rows)
-    if selected:
-        user_msg += (f"LIST SELECTION (resolved in code from your most recent "
-                     f"numbered list): the student's '{question.strip()[:30]}' means "
-                     f"item about {selected['name']} ({selected['college_id']}). "
-                     f"Reply with the FULL profile of this college only — every "
-                     f"field as short '- label: value' lines. Do not repeat the list.\n")
-    elif history and re.search(r"compare|tulna|difference|versus|\bvs\b|फ़?र्क|अंतर",
-                               question, re.I):
-        # "compare all 3" / "in dono me kya farak hai" — when no college is
-        # named, the referent is the most recent list; models grab the wrong
-        # colleges if left to guess, so resolve it in code.
-        if not any(_norm(r["name"]) in _norm(question) for r in all_rows):
-            listed = _resolve_list_items(history, all_rows)
-            if len(listed) >= 2:
-                ids = "; ".join(f"{r['name']} ({r['college_id']})" for r in listed[:4])
-                user_msg += (f"LIST REFERENCE (resolved in code): the student is "
-                             f"referring to your most recent list — compare EXACTLY "
-                             f"these colleges and NO others: {ids}.\n")
+    if negated and hits:
+        # "Which colleges do NOT offer X" has thousands of true answers here,
+        # so the old code-computed complement set is meaningless. The honest
+        # move is to scope the answer to the shortlist and say so.
+        user_msg += note(
+            "NEGATION QUESTION: a complete 'colleges that do NOT have X' list would "
+            "run to thousands of colleges, so do not attempt one. Answer for the "
+            "specific colleges the student asked about, or say plainly which of the "
+            "colleges shown here lack it — and say that is a shortlist, not the "
+            "full set.\n")
+
+    if merged_profile.get("marks_pct") and hits:
+        # The corpus has no cutoff column, so eligibility CANNOT be computed.
+        # Saying so explicitly is what stops the model inventing a verdict.
+        user_msg += note(
+            f"MARKS NOTE: the student scored {merged_profile['marks_pct']}%. We hold "
+            f"no admission cutoffs, so you must NOT say whether they qualify for any "
+            f"college. Acknowledge the score warmly, mention entrance exams a college "
+            f"accepts when that is listed, and point them to the college's own "
+            f"admission page for cutoffs.\n")
+
+    if picked_text:
+        picked = _match_hit(picked_text, hits)
+        if picked:
+            user_msg += note(
+                f"LIST SELECTION (resolved in code from your most recent numbered "
+                f"list): the student's '{question.strip()[:30]}' means "
+                f"{picked['name']}, {picked.get('city')}. Reply with the FULL profile "
+                f"of this college only — every field as short '- label: value' lines. "
+                f"Do not repeat the list.\n")
+    elif compare_texts:
+        listed = [h for h in (_match_hit(t, hits) for t in compare_texts) if h]
+        if len(listed) >= 2:
+            names = "; ".join(f"{h['name']}, {h.get('city')}" for h in listed[:4])
+            user_msg += note(
+                f"LIST REFERENCE (resolved in code): the student is referring to your "
+                f"most recent list — compare EXACTLY these colleges and NO others: "
+                f"{names}.\n")
+
+    if filters.get("include_abroad"):
+        user_msg += note(
+            "ABROAD IN VIEW: some colleges here are overseas. Their tuition is in the "
+            "institution's own currency — never write it as rupees, never convert it, "
+            "and never compare it to an Indian budget. Say which country it is in.\n")
 
     if hist_text:
         # Feed back the previous reply's opening words so the model can't fall
@@ -1328,35 +1887,25 @@ def answer_question(question, history=None, known_profile=None):
               "career perspective, not college-specific data, phrased like a "
               "big sibling sharing real perspective, not a report.\n")
     if unit_note:
-        user_msg += (f"UNIT ASSUMPTION (weave it naturally into the answer as one "
-                     f"phrase — NEVER print a label like 'unit note'): {unit_note}\n")
-    if filters:
-        applied = {k: v for k, v in filters.items() if v}
-        if applied:
-            user_msg += (f"HARD FILTERS ALREADY APPLIED to CONTEXT: {json.dumps(applied)} "
-                         f"(colleges failing them were removed before you saw the data). "
-                         f"CONTEXT IS THEREFORE A FILTERED VIEW, NOT THE WHOLE LIST — "
-                         f"never say 'we don't have any X' or 'X isn't offered anywhere' "
-                         f"based on it. The honest phrasing is 'no college matching your "
-                         f"score/budget offers X', which is a completely different "
-                         f"statement, and never contradict something you already told "
-                         f"the student earlier in this conversation.\n")
-            if "max_annual_fee_inr" in applied:
-                user_msg += ("REMINDER for budget answers: tuition figures EXCLUDE "
-                             "hostel/mess/kit/lab charges described in About — mention "
-                             "any such extra charges relevant to the colleges you list.\n")
-            # Enumeration + structured filters + no course qualifier: the
-            # qualifying set IS the context — hand the model the full id list
-            # so a partial enumeration is impossible.
-            if (route_info.get("question_kind") == "enumerate"
-                    and not course_terms and results):
-                id_list = ", ".join(sorted(context_ids))
-                user_msg += (f"EVERY college in CONTEXT satisfies these filters. If the "
-                             f"question asks which colleges fit/qualify, your answer and "
-                             f"citations MUST include ALL of: {id_list}\n")
+        user_msg += note(f"UNIT ASSUMPTION (weave it naturally into the answer as one "
+                         f"phrase — NEVER print a label like 'unit note'): {unit_note}\n")
+    applied = {k: v for k, v in filters.items() if v}
+    if applied:
+        user_msg += (f"HARD FILTERS ALREADY APPLIED to CONTEXT: {json.dumps(applied)} "
+                     f"(colleges failing them were removed before you saw the data). "
+                     f"CONTEXT IS THEREFORE A FILTERED VIEW, NOT THE WHOLE LIST — "
+                     f"never say 'we don't have any X' or 'X isn't offered anywhere' "
+                     f"based on it. The honest phrasing is 'no college matching your "
+                     f"budget/location offers X', which is a completely different "
+                     f"statement, and never contradict something you already told "
+                     f"the student earlier in this conversation.\n")
+        if "max_tuition_inr" in applied:
+            user_msg += ("REMINDER for budget answers: tuition figures EXCLUDE "
+                         "hostel/mess/kit/exam charges — mention any such extra "
+                         "charges the listings actually describe.\n")
     # Targeted counselling instruction beats a rule buried in the system
     # prompt: when the student only shared their profile, ask before dumping.
-    if route_info.get("question_kind") == "profile_share":
+    if question_kind == "profile_share":
         user_msg += ("THE STUDENT HAS NOT ASKED A QUESTION — they only shared facts "
                      "about themselves. Respond like a real counsellor: warmly "
                      "acknowledge what they shared, give ONE encouraging line about "
@@ -1366,12 +1915,12 @@ def answer_question(question, history=None, known_profile=None):
                      "'most of the colleges we work with across India' when most "
                      "qualify, or 'several of the colleges we work with across "
                      "India' when fewer do — ALWAYS the phrase 'across India', "
-                     "never a state name like Uttarakhand. Example "
-                     "tone: 'That is a strong score! You are eligible for most of "
-                     "the colleges we work with across India. To help me narrow down "
-                     "the best options for your future, which field or stream are "
-                     "you interested in pursuing?' Then ask ONE specific follow-up "
-                     "question — their "
+                     "never a single state name. Example "
+                     "tone: 'That is a strong score! There is a lot open to you "
+                     "among the colleges we work with across India. To help me "
+                     "narrow down the best options for your future, which field or "
+                     "stream are you interested in pursuing?' Then ask ONE specific "
+                     "follow-up question — their "
                      "course/stream interest, budget, or preferred location. "
                      "Reply in the SAME language as the student's message "
                      "(English→English, Hindi→Hindi, Hinglish→Hinglish — 'bhaiya "
@@ -1386,24 +1935,27 @@ def answer_question(question, history=None, known_profile=None):
         user_msg += (f"LANGUAGE (detected in code): the student's current message is "
                      f"{lang} — write your ENTIRE reply in the same language and "
                      f"script. Do NOT reply in plain English.\n")
-    # An explicit "top 3" beats the completeness rule — resolved in code so the
-    # two instructions can never fight each other in the model's head.
-    want_n = _requested_count(question)
+    # An explicit "top 3" beats the scale rule's default — resolved in code so
+    # the two instructions can never fight each other in the model's head.
     if want_n:
         user_msg += (
             f"REQUESTED COUNT: the student asked for exactly {want_n}. Show "
             f"EXACTLY {want_n} colleges — no more, no fewer (unless fewer than "
-            f"{want_n} qualify at all, in which case say so). This OVERRIDES the "
-            f"completeness rule above. Rank them best-first on the criterion "
-            f"that matters for their question (placement, then NAAC, then fit "
-            f"to their budget/score) and order the list and any table columns "
-            f"in that same ranked order — a 'top {want_n}' presented out of "
-            f"order is not a top {want_n}.\n")
+            f"{want_n} qualify at all, in which case say so). Rank them best-first "
+            f"on the criterion that matters for their question (NAAC/NIRF standing, "
+            f"course fit, then fit to their budget) and order the list and any table "
+            f"columns in that same ranked order — a 'top {want_n}' presented out of "
+            f"order is not a top {want_n}. Still state the true total when one is "
+            f"given above.\n")
     user_msg += f"\nCURRENT QUESTION (answer this, in the conversation's context): {question}"
 
     # ---- 3. Grounded generation + 4. verification (one corrective retry) ---
     messages = [{"role": "system", "content": config.GEN_SYSTEM_PREFIX + GENERATOR_SYSTEM},
                 {"role": "user", "content": user_msg}]
+    # Figures we computed ourselves are legitimate for the model to repeat.
+    extra_ok = _ints("".join(code_notes))
+    if raw_budget:
+        extra_ok |= {raw_budget, raw_budget // 2, raw_budget * 2}
     result, verified = None, False
     for attempt in range(3):
         try:
@@ -1424,19 +1976,17 @@ def answer_question(question, history=None, known_profile=None):
             continue
 
         ok, problems = _verify(
-            result, context_ids,
-            allow_uncited=route_info.get("question_kind") == "profile_share")
-        rows_ctx = {r["college_id"]: r for r, _ in results}
+            result, context_ids, allow_uncited=question_kind == "profile_share")
         # Negation questions ("which colleges do NOT offer X") legitimately
         # cite colleges that lack the program — the exact-match check must
         # stand down there or it would flag every correct citation.
-        ignore_money = {raw_budget, (raw_budget or 0) // 2, (raw_budget or 0) * 2} \
-            if raw_budget else None
         problems = (problems
-                    + ([] if negated else _course_violations(result, question, rows_ctx))
-                    + _name_violations(result, all_rows, context_ids)
+                    + ([] if negated else
+                       _course_violations(result, question, hits_by_id, course_terms))
+                    + _name_violations(result, hits)
                     + _voice_violations(result)
-                    + _numeric_violations(result, all_rows, ignore_money))
+                    + _rank_violations(result, hits_by_id)
+                    + _numeric_violations(result, hits_by_id, extra_ok))
         if not problems:
             verified = True
             break
@@ -1455,7 +2005,7 @@ def answer_question(question, history=None, known_profile=None):
                   "reason_if_unanswered": "Transient provider error: no valid output after retries."}
     elif not verified:
         # Fail closed: an unverifiable answer must not be shipped as fact.
-        result = {"answer": "I found related records but could not verify a fully grounded "
+        result = {"answer": "I found related colleges but could not verify a fully grounded "
                             "answer, so I would rather not guess.",
                   "citations": [], "answered": False,
                   "reason_if_unanswered": "Grounding verification failed after retry."}
@@ -1465,7 +2015,8 @@ def answer_question(question, history=None, known_profile=None):
     result["answer"] = _format_answer(result["answer"])
 
     _log_metrics({"question": question, "route": route, "calls": calls,
-                  "retrieved": sorted(context_ids), "verified": verified,
+                  "retrieved": sorted(context_ids), "total_matching": total,
+                  "verified": verified,
                   "total_latency_s": round(time.perf_counter() - t_start, 3)})
     if config.CACHE_ENABLED and verified and not history:
         _cache_store(cache_key, result)

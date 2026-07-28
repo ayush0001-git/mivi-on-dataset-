@@ -92,9 +92,11 @@ def chat(messages, model, json_mode=False, temperature=0.2, max_tokens=800, usag
                 attempts += 1
                 rate_limited = ("429" in msg or "rate" in msg or "quota" in msg
                                 or "exhausted" in msg)
-                # Rate-limited with a fallback available: fail over NOW —
-                # waiting out a quota window mid-demo is pointless.
-                if rate_limited and p_idx < len(providers) - 1:
+                timed_out = "timeout" in msg or "timed out" in msg
+                # Rate-limited OR hung: fail over NOW — retrying a provider
+                # that just hung usually hangs again (measured: one hung
+                # connection turned a 3s answer into an 89s one).
+                if (rate_limited or timed_out) and p_idx < len(providers) - 1:
                     break
                 if attempts < max_attempts:
                     # Short, capped backoff: the old 10/20/30s waits produced
