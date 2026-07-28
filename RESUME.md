@@ -39,9 +39,46 @@ All three were started detached and survive a closed terminal. Check them with
 | NIRF rankings | 236 colleges |
 | Maharashtra FRA approved fees | 100 colleges |
 | Admission criteria | 148,631 facts · 24,182 colleges (62%) |
+| NAAC grades | 2,324 colleges (A++ 117 … C 115) |
+| Verified fee in the DB | 100 colleges, all FRA-approved 2024-25 |
 | Firecrawl | 3 keys pooled, ~2,200 spendable credits |
 | OCR | Tesseract 5.4 installed and wired |
 | Embedding device | GPU when usable (`pick_device`), else CPU |
+
+## Every fee now carries a date, or says it has none
+
+The client's question was "how do I know when this fee was updated". The answer
+differs by source, and the card says which:
+
+| source | date | rendered as |
+|---|---|---|
+| FRA approved | order date + academic year | "Rs 67,272 per year, for 2024-25, legally approved" |
+| College website | the year the PAGE states | "the page states these are for 2019-20 — OUT OF DATE" |
+| Catalogue (CSV) | **none exists** | "undated" |
+
+`stated_year()` in `sources/verify_facts.py` reads the academic year off the page
+text. This is NOT the fetch date, and conflating them is how a stale fee looks
+fresh — the card used to show only "checked 2026-07-28" for a page headed "Fee
+Structure 2019-20". Harvested years already range 2022-23 to 2026-27.
+
+**The catalogue fee genuinely has no date.** Measured: `courses` has no date
+column at all; the detail payload's course `createdAt` is 2026-03/04 for every
+row (the client's bulk import) and `updatedAt` is empty on all of them. So
+`createdAt` is an import timestamp, and showing it as "fee updated on" would make
+every fee look three months old when the underlying figure could be any year —
+hiding the staleness instead of exposing it. Do not do this.
+
+`sources/fee_promote.py` writes a dated fee into `colleges.verified_fee_*`. It
+does NOT touch `courses.tuition_min_inr`: a harvested fee can be wrong, and a
+wrong fee is the most damaging error here. Find stale ones with
+`WHERE verified_fee_year < '2024'`.
+
+Most harvested `fees` facts are NOT promotable, and this is not a bug. The
+payload is a bag of labelled amounts, not a fee — two real examples:
+`{"Tuition Fee for NRI students": "US$ 7000.00", "Hostel ... Charges": "Rs. 4000.00"}`
+and `{"fees / fees after deduction": "Rs.500/-"}`. The second is a refund clause.
+A line item is promoted only when its label says tuition, its currency is rupees,
+its magnitude is plausible, and the fact carries a stated year.
 
 ## Where the missing data actually came from
 

@@ -284,13 +284,81 @@ def fetch_nirf(year: str = "2024", categories=NIRF_CATEGORIES,
 
 def _load_catalogue() -> list[dict]:
     return get_backend().q(
-        "SELECT college_id, name, city, state FROM colleges WHERE NOT is_abroad")
+        "SELECT college_id, name, city, district, state FROM colleges "
+        "WHERE NOT is_abroad")
 
 
-def _index_by_city(colleges: list[dict]) -> dict[str, list[dict]]:
+def _load_place_aliases() -> dict[str, str]:
+    """alias -> canonical, from the curated place_alias table.
+
+    The matcher was ignoring this table, and city agreement is what decides
+    which floor a candidate must clear (0.72 with it, 0.92 without). So a place
+    written two ways was silently costing real matches: NIRF's "New Delhi"
+    against a catalogue "Delhi" is the same city, and treating it as a
+    disagreement is a normalisation bug, not caution.
+    """
+    try:
+        rows = get_backend().q("SELECT alias, canonical FROM place_alias")
+    except Exception:  # noqa: BLE001 - table absent on a store built before it
+        return {}
+    return {_norm(r["alias"]): _norm(r["canonical"]) for r in rows
+            if r.get("alias") and r.get("canonical")}
+
+
+# Registry-side spellings that place_alias does not carry because they are not
+# what students type -- these come from how the registries themselves write a
+# place. Kept small and explicit rather than inferred: a wrong equivalence here
+# would let one city's college corroborate another's.
+_CITY_FORMS = {
+    "new delhi": "delhi",
+    "gautam budh nagar": "noida",
+    "gautam buddha nagar": "noida",
+    "greater noida": "noida",
+    "trivandrum": "thiruvananthapuram",
+    "gurgaon": "gurugram",
+    "mysore": "mysuru",
+    "pondicherry": "puducherry",
+    "kanpur nagar": "kanpur",
+    "prayagraj": "allahabad",
+    "varanasi cantt": "varanasi",
+    # The loosest entry here: Navi Mumbai is its own city, not a spelling of
+    # Mumbai. Kept because registries file the same institution under both, and
+    # because city agreement only lowers the floor -- the family, token
+    # containment, acronym and leading-brand gates still have to pass.
+    "navi mumbai": "mumbai",
+}
+
+
+def _place_key(value, aliases: dict[str, str]) -> str:
+    """One canonical spelling for a city or district name."""
+    v = _norm(value)
+    if not v:
+        return ""
+    v = _CITY_FORMS.get(v, v)
+    return aliases.get(v, v)
+
+
+def _index_by_city(colleges: list[dict],
+                   aliases: dict[str, str] | None = None) -> dict[str, list[dict]]:
+    """place -> colleges, keyed by BOTH city and district.
+
+    District matters because registries often report the administrative district
+    while the catalogue holds the town: NIRF files Shiv Nadar University under
+    "Gautam Budh Nagar" and the catalogue calls it Greater Noida. Without the
+    district key those rows fall to the no-city path and need 0.92.
+    """
+    aliases = aliases or {}
     idx: dict[str, list[dict]] = {}
     for c in colleges:
-        idx.setdefault(_norm(c.get("city")), []).append(c)
+        for field in ("city", "district"):
+            key = _place_key(c.get(field), aliases)
+            if not key:
+                continue
+            bucket = idx.setdefault(key, [])
+            # A college whose city and district are the same word must not be
+            # listed twice — it would be scored twice for no reason.
+            if not bucket or bucket[-1] is not c:
+                bucket.append(c)
     return idx
 
 
@@ -310,7 +378,8 @@ def _index_by_token(colleges: list[dict]) -> dict[str, list[dict]]:
     return idx
 
 
-def match_one(entry: dict, by_city: dict, by_token: dict) -> tuple[dict | None, float, str]:
+def match_one(entry: dict, by_city: dict, by_token: dict,
+              aliases: dict[str, str] | None = None) -> tuple[dict | None, float, str]:
     """Best catalogue match for one NIRF row: (college, score, why).
 
     Candidates are drawn from the NIRF city first. That is the whole defence
@@ -318,7 +387,7 @@ def match_one(entry: dict, by_city: dict, by_token: dict) -> tuple[dict | None, 
     institutions, and only the city separates them, so a name-first search would
     confidently pick the wrong one.
     """
-    nirf_city = _norm(entry.get("city"))
+    nirf_city = _place_key(entry.get("city"), aliases or {})
     nirf_sig = _sig(entry["name"])
     nirf_ac = _acronym(entry["name"])
 
@@ -487,17 +556,20 @@ def ingest_nirf(year: str = "2024", dry_run: bool = False,
         return {}
 
     colleges = _load_catalogue()
-    by_city = _index_by_city(colleges)
+    aliases = _load_place_aliases()
+    by_city = _index_by_city(colleges, aliases)
     by_token = _index_by_token(colleges)
     print(f"[nirf] matching {len(rows)} ranked institutions against "
-          f"{len(colleges)} catalogue colleges", file=sys.stderr)
+          f"{len(colleges)} catalogue colleges "
+          f"({len(by_city):,} place keys, {len(aliases):,} aliases)",
+          file=sys.stderr)
 
     be = get_backend()
     stats = {"rows": len(rows), "matched": 0, "unmatched": 0}
     samples: list[str] = []
 
     for e in rows:
-        college, score, why = match_one(e, by_city, by_token)
+        college, score, why = match_one(e, by_city, by_token, aliases)
         payload = {
             "rank": e["rank"], "score": e["score"], "category": e["category"],
             "sub_scores": e["sub_scores"], "nirf_name": e["name"],

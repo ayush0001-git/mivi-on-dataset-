@@ -55,6 +55,7 @@ import httpx
 # landing in the wrong database.
 from .. import config  # noqa: F401
 from ..store.backend import get_backend
+from .verify_facts import stated_year
 from .verify_facts import verify as verify_fact
 
 UA = ("Mozilla/5.0 (compatible; MakeMyEducationBot/1.0; "
@@ -633,15 +634,23 @@ def _pool():
 FACT_UPSERT = """
 INSERT INTO college_web_facts
     (college_id, kind, summary, payload, source_url, fetched_at, extractor,
-     confidence)
-VALUES (%s, %s, %s, %s, %s, %s, %s, %s)
+     confidence, stated_year)
+VALUES (%s, %s, %s, %s, %s, %s, %s, %s, %s)
 ON CONFLICT (college_id, kind) DO UPDATE SET
-    summary    = EXCLUDED.summary,
-    payload    = EXCLUDED.payload,
-    source_url = EXCLUDED.source_url,
-    fetched_at = EXCLUDED.fetched_at,
-    extractor  = EXCLUDED.extractor,
-    confidence = EXCLUDED.confidence"""
+    summary     = EXCLUDED.summary,
+    payload     = EXCLUDED.payload,
+    source_url  = EXCLUDED.source_url,
+    fetched_at  = EXCLUDED.fetched_at,
+    extractor   = EXCLUDED.extractor,
+    confidence  = EXCLUDED.confidence,
+    stated_year = EXCLUDED.stated_year"""
+
+# stated_year is the academic year the PAGE says its figures are for, which is a
+# different fact from fetched_at (when we looked). Kept as its own column rather
+# than buried in payload so the card renderer can select it without parsing
+# JSONB for all 38,700 colleges on every build.
+STATED_YEAR_DDL = ("ALTER TABLE college_web_facts "
+                   "ADD COLUMN IF NOT EXISTS stated_year TEXT")
 
 # An upsert, not the bare UPDATE this used to be. An UPDATE that matches no row
 # reports success and quietly loses the result, so any college whose queue row
@@ -730,7 +739,8 @@ class HarvestWriter:
         self._facts.append(
             (cid, kind, got["summary"],
              json.dumps(got["facts"], ensure_ascii=False),
-             url, _now(), got.get("_via", "llm"), got["confidence"]))
+             url, _now(), got.get("_via", "llm"), got["confidence"],
+             got.get("_stated_year")))
 
     def mark(self, cid: str, status: str, pages: int, site: str | None) -> None:
         # `site` is carried only for the insert branch of STATE_UPSERT, i.e. the
@@ -829,6 +839,11 @@ async def enrich_one(client, pol, writer: "HarvestWriter", college: dict, fc=Non
                   f"{got['_reasons'][:90]}", file=sys.stderr)
             continue
 
+        # How old the FIGURE is, which the fetch date does not tell you: a page
+        # headed "Fee Structure 2019-20" fetched today is a 2019 fee. Read from
+        # the same text the verifier anchored against, so the year and the
+        # numbers come from one document.
+        got["_stated_year"] = stated_year(text)
         writer.fact(cid, kind, url, got)
         stats["facts"] += 1
         if checked.verdict == "UNCERTAIN":
@@ -910,8 +925,12 @@ async def enrich_one(client, pol, writer: "HarvestWriter", college: dict, fc=Non
 async def sweep(limit: int | None = None, concurrency: int = 10,
                 delay: float = 1.5, firecrawl_reserve: int = 100,
                 firecrawl_max: int | None = None,
-                use_llm: bool = True) -> dict:
+                use_llm: bool = True, shard: int = 0,
+                shards: int = 1) -> dict:
     _pool()   # fail now, not after an hour of polite crawling
+    # Idempotent, and cheap enough to run every sweep: a store built before
+    # stated_year existed must not make the first fact write fail.
+    get_backend().execute(STATED_YEAR_DDL)
     seeded = seed_queue()
     if seeded:
         print(f"[web] queued {seeded} colleges with a website URL", file=sys.stderr)
@@ -921,18 +940,34 @@ async def sweep(limit: int | None = None, concurrency: int = 10,
     # would be ordering on physical position — which moves every time a row is
     # updated, i.e. every time this sweep touches it. Restating the seed's own
     # priority is both stable and what the ordering always meant.
+    # Shard filter so a second process can work the same queue without racing
+    # it. There is no claim or lease on web_crawl_state, so two unsharded
+    # workers would select the SAME pending rows in the same order: duplicated
+    # OCR (the expensive part) and, worse, two hits on every college's site,
+    # which breaks the per-domain politeness this sweep otherwise honours.
+    #
+    # hashtext() partitions by college_id — deterministic, disjoint, and needing
+    # no coordination between the processes.
+    shard_sql, shard_args = "", []
+    if shards > 1:
+        shard_sql = " AND abs(hashtext(s.college_id)) % ? = ?"
+        shard_args = [shards, shard]
+
     todo = get_backend().q(
         "SELECT s.college_id, s.website_url, c.name, c.city "
         "FROM web_crawl_state s "
         "JOIN colleges c USING(college_id) "
         "LEFT JOIN college_agg a USING(college_id) "
         "WHERE s.status = 'pending' AND s.website_url IS NOT NULL "
-        "ORDER BY COALESCE(a.n_courses, 0) DESC LIMIT ?", [limit or 1_000_000])
+        + shard_sql +
+        " ORDER BY COALESCE(a.n_courses, 0) DESC LIMIT ?",
+        [*shard_args, limit or 1_000_000])
     if not todo:
         print("[web] nothing pending", file=sys.stderr)
         return {"done": 0}
 
-    print(f"[web] sweeping {len(todo)} colleges "
+    where = f" shard {shard}/{shards}" if shards > 1 else ""
+    print(f"[web] sweeping {len(todo)} colleges{where} "
           f"(concurrency {concurrency}, {delay}s per domain)", file=sys.stderr)
 
     pol = Politeness(delay=delay)
@@ -1050,6 +1085,11 @@ def main() -> None:
                     help="credits to hold back for later runs")
     ap.add_argument("--firecrawl-max", type=int, default=None,
                     help="hard cap on credits this run may spend")
+    ap.add_argument("--shards", type=int, default=1,
+                    help="split the pending queue into N disjoint parts so that "
+                         "N processes can sweep without racing each other")
+    ap.add_argument("--shard", type=int, default=0,
+                    help="which part this process takes (0-based)")
     ap.add_argument("--refresh-days", type=int, default=None,
                     help="requeue colleges harvested more than N days ago, then sweep "
                          "(schedule this monthly to keep fees/scholarships current)")
@@ -1061,10 +1101,13 @@ def main() -> None:
         n = requeue_stale(a.refresh_days)
         print(f"[web] requeued {n} colleges older than {a.refresh_days} days",
               file=sys.stderr)
+    if not 0 <= a.shard < a.shards:
+        sys.exit(f"--shard must be in 0..{a.shards - 1}")
     asyncio.run(sweep(limit=a.limit, concurrency=a.concurrency, delay=a.delay,
                       firecrawl_reserve=a.firecrawl_reserve,
                       firecrawl_max=a.firecrawl_max,
-                      use_llm=not a.no_llm))
+                      use_llm=not a.no_llm,
+                      shard=a.shard, shards=a.shards))
 
 
 if __name__ == "__main__":

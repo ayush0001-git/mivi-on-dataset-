@@ -38,6 +38,7 @@ from __future__ import annotations
 
 import json
 import re
+from datetime import datetime, timezone
 import sys
 from dataclasses import dataclass, field
 
@@ -453,3 +454,61 @@ def cross_check(facts_by_page: dict[str, dict]) -> tuple[str, list[str]]:
     return "CONFLICT", [
         f"{sets[0][0]} and {sets[1][0]} report different figures "
         f"({sorted(a)[:3]} vs {sorted(b)[:3]}) — surface both, pick neither"]
+
+
+# ---------------------------------------------------------------------------
+# how old is this figure?
+# ---------------------------------------------------------------------------
+
+# "2025-26", "2025-2026", "2025/26", "AY 2024-25", "Session 2023-24"
+_AY_RE = re.compile(
+    r"(?:a\.?y\.?|academic\s+year|session|batch|admission)?\s*"
+    r"\b(20[0-4]\d)\s*[-/–]\s*(\d{2}|20[0-4]\d)\b", re.I)
+# A bare year, only when a fee/admission word vouches for it. "2019" alone on a
+# page is as likely to be a copyright footer or an establishment year.
+_BARE_YEAR_RE = re.compile(
+    r"(?:fee|fees|tuition|charges|admission|session|academic)[^.\n]{0,40}?"
+    r"\b(20[0-4]\d)\b|\b(20[0-4]\d)\b[^.\n]{0,20}?"
+    r"(?:fee\s*structure|fees|tuition)", re.I)
+
+
+def stated_year(text: str, *, now_year: int | None = None) -> str | None:
+    """The academic year a page says its figures are FOR, or None.
+
+    This is not the same fact as when we fetched the page, and conflating the
+    two is the specific way a stale fee looks fresh: the card used to say only
+    "checked 2026-07-28", which a reader takes as "this fee is from 2026" when
+    the page it came from is headed "Fee Structure 2019-20".
+
+    The latest year on the page wins. Fee pages accumulate — last year's table is
+    usually still there below this year's — so the earliest match would
+    systematically under-date every figure.
+
+    Returns None rather than guessing. An undated fee must be presented as
+    undated; inventing a year here would be worse than admitting we do not know.
+    """
+    if not text:
+        return None
+    cap = (now_year or datetime.now(timezone.utc).year) + 1
+    best: tuple[int, str] | None = None
+
+    for m in _AY_RE.finditer(text[:60_000]):
+        start = int(m.group(1))
+        tail = m.group(2)
+        end = int(tail) if len(tail) == 4 else int(str(start)[:2] + tail)
+        # An academic year spans one or two calendar years, never more: "2015-30"
+        # is a validity range or a phone number, not a session.
+        if not 2000 <= start <= cap or end - start not in (0, 1):
+            continue
+        label = f"{start}-{str(end)[-2:]}"
+        if best is None or start > best[0]:
+            best = (start, label)
+
+    if best:
+        return best[1]
+
+    for m in _BARE_YEAR_RE.finditer(text[:60_000]):
+        y = int(m.group(1) or m.group(2))
+        if 2000 <= y <= cap and (best is None or y > best[0]):
+            best = (y, str(y))
+    return best[1] if best else None

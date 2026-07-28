@@ -175,6 +175,21 @@ GAP_DDL = (
            source    TEXT
        )""",
     "CREATE INDEX IF NOT EXISTS idx_alias_canonical ON place_alias(canonical)",
+    # The dated fee that sources/fee_promote.py writes onto colleges. Declared
+    # here so the staging table has the columns the card SELECT reads.
+    #
+    # Deliberately NOT carried over from the serving schema: unlike the harvest,
+    # this value is fully DERIVED — from registry_fact plus college_web_facts,
+    # both of which ARE carried. Recomputing it after the swap cannot drift from
+    # its inputs, whereas copying it could preserve a figure whose source row
+    # was meanwhile corrected. See promote_verified_fees() below.
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS verified_fee_inr BIGINT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS verified_fee_period TEXT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS verified_fee_year TEXT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS verified_fee_basis TEXT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS verified_fee_label TEXT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS verified_fee_source TEXT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS verified_fee_at TIMESTAMPTZ",
 )
 
 
@@ -1049,6 +1064,8 @@ _CARD_SELECT = """
 SELECT c.college_id, c.name, c.city, c.district, c.state, c.country, c.type,
        c.establish_year, c.naac_grade, c.nirf_ranking, c.affiliated_university,
        c.is_abroad, c.about, c.details,
+       c.verified_fee_inr, c.verified_fee_period, c.verified_fee_year,
+       c.verified_fee_basis, c.verified_fee_label,
        a.n_courses, a.program_levels, a.course_titles, a.entrance_exams,
        a.min_tuition_inr, a.max_tuition_inr, a.min_hostel_inr, a.has_hostel,
        r.blob, x.placement, x.scholarship, x.accommodation, x.facility
@@ -1088,14 +1105,69 @@ def render_cards(conn, reader) -> dict:
     # the swap would publish cards that silently lost days of crawling.
     web: dict[str, dict] = {}
     with conn.cursor() as cur:
+        # stated_year may not exist on a store built before it was added, and a
+        # missing column must cost the harvest's dates, not the whole build.
+        cur.execute("SELECT EXISTS (SELECT 1 FROM information_schema.columns "
+                    "WHERE table_name='college_web_facts' "
+                    "AND column_name='stated_year') AS ok")
+        has_year = bool(cur.fetchone()["ok"])
         cur.execute(
-            "SELECT college_id, kind, summary, confidence, fetched_at "
-            "FROM college_web_facts WHERE summary IS NOT NULL AND TRIM(summary) <> ''"
+            "SELECT college_id, kind, summary, confidence, fetched_at"
+            + (", stated_year" if has_year else ", NULL AS stated_year") +
+            " FROM college_web_facts WHERE summary IS NOT NULL AND TRIM(summary) <> ''"
         )
         for r in cur.fetchall():
             web.setdefault(r["college_id"], {})[r["kind"]] = {
                 "summary": r["summary"], "confidence": r["confidence"],
-                "fetched_at": r["fetched_at"]}
+                "fetched_at": r["fetched_at"],
+                "stated_year": r["stated_year"]}
+
+    # Promote the Fee Regulating Authority's approved fee onto colleges BEFORE
+    # the cards are rendered, so this build's cards carry it rather than waiting
+    # for the next one. carry_over_harvest() has already put registry_fact into
+    # this schema, so the inputs are here.
+    #
+    # sources/fee_promote.py owns the full promotion, including the college-site
+    # tier, which needs label classification that does not belong in SQL. Only
+    # the FRA tier is repeated here, and only because it is a two-key JSONB read
+    # of the same rows — small enough that keeping cards correct in one pass
+    # beats avoiding the duplication. Both read registry_fact; neither invents.
+    #
+    # DISTINCT ON keeps one row per college: a college with an approved fee for
+    # both ENGG and MBA has two, and the lower is the safer one to show.
+    try:
+        with conn.transaction(), conn.cursor() as cur:
+            cur.execute("""
+                UPDATE colleges c SET
+                    verified_fee_inr    = s.amt,
+                    verified_fee_period = 'year',
+                    verified_fee_year   = s.year,
+                    verified_fee_basis  = 'fra_approved',
+                    verified_fee_label  = s.label,
+                    verified_fee_source = s.source_url,
+                    verified_fee_at     = s.fetched_at
+                FROM (
+                    SELECT DISTINCT ON (college_id) college_id,
+                        COALESCE((payload->>'approved_tuition_inr')::BIGINT,
+                                 (payload->>'approved_total_inr')::BIGINT) AS amt,
+                        year,
+                        'Fee Regulating Authority approved tuition'
+                          || COALESCE(' [' || (payload->>'stream') || ']', '') AS label,
+                        source_url, fetched_at
+                    FROM registry_fact
+                    WHERE registry LIKE 'fra%'
+                      AND COALESCE(payload->>'approved_tuition_inr',
+                                   payload->>'approved_total_inr') IS NOT NULL
+                    ORDER BY college_id, amt ASC
+                ) s
+                WHERE c.college_id = s.college_id""")
+            promoted = cur.rowcount
+        if promoted:
+            print(f"[cards] promoted an approved fee onto {promoted:,} colleges",
+                  file=sys.stderr)
+    except Exception as exc:  # noqa: BLE001 - no registry yet on a fresh store
+        conn.rollback()
+        print(f"[cards] fee promotion skipped ({str(exc)[:70]})", file=sys.stderr)
 
     # Registry facts (NIRF ranks, state Fee Regulating Authority approved fees)
     # and MakeMyEducation's own admission records. Both were being LOST here:

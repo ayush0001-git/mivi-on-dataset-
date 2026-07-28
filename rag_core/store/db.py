@@ -16,6 +16,7 @@ from __future__ import annotations
 import html
 import json
 import re
+from datetime import date as _date
 
 from .backend import DEFAULT_PG_DSN, get_backend
 
@@ -153,6 +154,29 @@ def render_registry_lines(reg: list | None) -> list[str]:
             out.append(line)
             continue
 
+        # NAAC accreditation. The catalogue's own naac_grade column is empty on
+        # 38,698 of 38,700 rows, so without this MIVI cannot answer one of the
+        # three questions students ask most. The declaration date is not
+        # decoration: a NAAC cycle runs about five years, so a grade declared in
+        # 2019 may have been re-assessed, and a bare "A+" would be read as
+        # today's grade.
+        grade = payload.get("grade")
+        if grade:
+            line = f"NAAC accreditation grade {grade}"
+            if payload.get("cgpa"):
+                line += f" (CGPA {payload['cgpa']}/4.00)"
+            if payload.get("cycle"):
+                line += f", cycle {payload['cycle']}"
+            declared = payload.get("declared")
+            if declared:
+                line += f", declared {declared}"
+            line += (f". From NAAC's list of valid accreditations as on "
+                     f"{payload.get('as_on') or year}; a NAAC cycle lasts about "
+                     f"five years, so give the date and tell the student to "
+                     f"confirm the current grade with the college.")
+            out.append(line)
+            continue
+
         rank, score = payload.get("rank"), payload.get("score")
         if not rank:
             continue
@@ -211,6 +235,34 @@ def render_card(college: dict, agg: dict | None = None, facts: dict | None = Non
         lines.append(f"NAAC grade: {college['naac_grade']}.")
     if college.get("nirf_ranking"):
         lines.append(f"NIRF ranking: {college['nirf_ranking']}.")
+
+    # The dated fee held in the database itself (sources/fee_promote.py). Placed
+    # here, above the catalogue rollup, because when a legally approved annual
+    # figure exists it is the number a student should plan around — and unlike
+    # the catalogue's, it carries the year it applies to.
+    vf = college.get("verified_fee_inr")
+    if vf:
+        per = college.get("verified_fee_period") or "unspecified"
+        per_txt = {"year": "per year", "semester": "per semester"}.get(
+            per, "period not stated on the source")
+        yr = college.get("verified_fee_year") or "an unstated year"
+        basis = college.get("verified_fee_basis")
+        who = ("the state Fee Regulating Authority (legally approved)"
+               if basis == "fra_approved" else "the college's own website")
+        line = (f"Verified fee on record: {_rupees(vf)} {per_txt}, for {yr}, "
+                f"from {who}")
+        if college.get("verified_fee_label"):
+            line += f" — {college['verified_fee_label']}"
+        try:
+            age = _date.today().year - int(str(yr)[:4])
+        except (TypeError, ValueError):
+            age = 0
+        if age >= 2:
+            line += (f". This is {age} years old and fees are revised annually, "
+                     f"so quote it as the last approved figure, not the current "
+                     f"one")
+        lines.append(line + ".")
+
     # Government-published rankings, matched to this college by
     # rag_core/sources/registries.py. Placed here with the other verified
     # identity facts rather than under the website-harvest heading: NIRF is a
@@ -265,7 +317,26 @@ def render_card(college: dict, agg: dict | None = None, facts: dict | None = Non
             summary = str(item.get("summary") or "").strip()
             if not summary or float(item.get("confidence") or 0) < 0.5:
                 continue
-            rendered.append(f"  - {kind.capitalize()}: {summary[:320]}")
+            line = f"  - {kind.capitalize()}: {summary[:320]}"
+            # The year the PAGE says the figures are for — a different fact from
+            # the fetch date below, and the one that decides whether a fee is
+            # usable. A "Fee Structure 2019-20" table fetched this month is a
+            # 2019 fee, and saying only "checked 2026-07" invites the student to
+            # read it as current. Age is spelled out rather than left as
+            # arithmetic on two dates.
+            year = str(item.get("stated_year") or "").strip()
+            if year:
+                head = year[:4]
+                age = _date.today().year - int(head) if head.isdigit() else 0
+                stale = (" — OUT OF DATE, treat as indicative only and tell the "
+                         "student to get the current figure from the college"
+                         if age >= 2 else "")
+                line += f" [the page states these are for {year}{stale}]"
+            elif kind in ("fees", "scholarship", "cutoff", "hostel"):
+                # Absence is informative here and must not be silent: an undated
+                # figure cannot be aged, so it cannot be trusted as current.
+                line += " [the page gives no year for these figures — undated]"
+            rendered.append(line)
         if rendered:
             when = ""
             for kind in ("scholarship", "fees", "cutoff", "hostel", "placement",
