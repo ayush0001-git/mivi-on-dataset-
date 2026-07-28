@@ -76,6 +76,9 @@ QUERY_PREFIX = "query: "
 # Sentence-transformers' own batch size. 128 keeps CPU batches full without a
 # multi-GB activation spike; override when the ETL is not competing for cores.
 DEFAULT_BATCH = int(os.getenv("MME_EMBED_BATCH", "128"))
+# A 4 GB laptop GPU holds a MiniLM-class model plus this batch comfortably; the
+# CPU default is far too small to keep a GPU busy.
+GPU_BATCH = int(os.getenv("MME_EMBED_BATCH_GPU", "512"))
 
 # Flush a partial index this often (in newly embedded cards). A 54 MB write
 # costs ~0.2 s; losing 20 minutes of embedding to a killed terminal costs more.
@@ -190,14 +193,46 @@ def _card_hash(card: str) -> str:
 # ---------------------------------------------------------------------------
 
 
-def _load_model(name: str):
+def pick_device() -> str:
+    """"cuda" when a usable GPU is present, else "cpu".
+
+    Embedding is the one genuinely GPU-shaped job here: 24,607 cards took 72
+    minutes at 5.7/s on the CPU, and every harvest makes the index stale again,
+    so this cost is paid repeatedly. It also shortens the query path, which is
+    what a student actually waits on.
+
+    NOT set to cuda blindly: a CPU-only torch build reports no CUDA, and a
+    machine whose driver is older than the wheel's runtime raises on the first
+    real kernel rather than at import. So the probe runs a tiny op and falls
+    back rather than letting a 25,000-card run die at card 1.
+
+    MIVI_EMBED_DEVICE overrides, for reproducing a CPU-built index exactly.
+    """
+    forced = os.environ.get("MIVI_EMBED_DEVICE", "").strip().lower()
+    if forced:
+        return forced
+    try:
+        import torch
+        if not torch.cuda.is_available():
+            return "cpu"
+        torch.zeros(8, device="cuda").sum().item()   # prove a kernel runs
+        return "cuda"
+    except Exception as exc:  # noqa: BLE001 - any GPU failure means use the CPU
+        print(f"[index] GPU unusable ({type(exc).__name__}: {str(exc)[:70]}); "
+              f"embedding on CPU", file=sys.stderr)
+        return "cpu"
+
+
+def _load_model(name: str, device: str | None = None):
     from sentence_transformers import SentenceTransformer  # lazy: heavy import
 
+    device = device or pick_device()
     try:
         # Cached model: skip the Hub online check, which costs seconds per run.
-        return SentenceTransformer(name, local_files_only=True)
+        return SentenceTransformer(name, local_files_only=True, device=device)
     except Exception:
-        return SentenceTransformer(name)  # first run on this machine: download
+        # first run on this machine: download
+        return SentenceTransformer(name, device=device)
 
 
 # ---------------------------------------------------------------------------
@@ -413,7 +448,13 @@ def build_index(
             print(f"[index] could not reuse {out.name} ({e}); embedding from scratch",
                   file=sys.stderr)
 
-    model = _load_model(embed_model)
+    device = pick_device()
+    model = _load_model(embed_model, device)
+    # A GPU is idle-fast on tiny batches, so it wants a much bigger one than the
+    # CPU default; the whole point is to keep the device fed.
+    if device.startswith("cuda") and batch_size < GPU_BATCH:
+        print(f"[index] cuda: batch {batch_size} -> {GPU_BATCH}", file=sys.stderr)
+        batch_size = GPU_BATCH
     # sentence-transformers renamed this; support both so a library bump does
     # not break the build (or spam a FutureWarning on every run).
     _dim_fn = getattr(model, "get_embedding_dimension", None) or \

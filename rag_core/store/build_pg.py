@@ -125,6 +125,26 @@ CARRY_TABLES = (
     # build, so its rows are always the fresher ones.
     ("college_web_facts", ("college_id", "kind"), True, True),
     ("web_crawl_state", ("college_id",), True, True),
+    # Just as un-re-derivable, and previously absent from this list, so an ETL
+    # run would have destroyed all of it with no error:
+    #   registry_fact       NIRF ranks and state Fee Regulating Authority
+    #                       approved fees, matched to colleges by hand-tuned
+    #                       entity resolution that took three corrections to
+    #                       get right. Re-earning it means re-scraping and
+    #                       re-matching every registry.
+    #   registry_unmatched  the registry rows that did NOT match. Kept because
+    #                       it is the only record of what the matcher missed.
+    #   college_admission   148,631 admission criteria recovered from the detail
+    #                       crawl, gated per value.
+    #   fact_verification   the verifier's verdicts. Losing them silently
+    #                       un-verifies every fact the sweep ever confirmed.
+    #   ...quarantine       the rejects. Losing them loses the evidence for why
+    #                       a fact was refused, and the ability to restore it.
+    ("registry_fact", ("college_id", "registry", "category", "year"), True, True),
+    ("registry_unmatched", ("registry", "ref_id", "category", "year"), False, True),
+    ("college_admission", ("college_id", "course_title", "kind"), True, True),
+    ("fact_verification", ("college_id", "kind"), True, True),
+    ("college_web_facts_quarantine", ("college_id", "kind"), True, True),
     # The students' own memory — marks, budget, stream, and the transcript that
     # lets a long chat be summarised rather than truncated. Written live.
     ("student_profile", ("session_id",), False, True),
@@ -400,6 +420,26 @@ def create_staging(conn, stage: str) -> None:
             cur.execute(stmt)
         for stmt in GAP_DDL:
             cur.execute(stmt)
+        # Every carried table must EXIST in the staging schema or the carry-over
+        # INSERT has nowhere to land. Cloning the live definition beats writing
+        # DDL here: these tables are owned by the modules that harvest into them
+        # (sources/registries.py, sources/admission_ingest.py,
+        # sources/verify_facts.py), and a second hand-maintained copy of their
+        # shape is a copy that drifts. INCLUDING ALL keeps the primary keys the
+        # carry-over's ON CONFLICT depends on.
+        for table, *_ in CARRY_TABLES:
+            cur.execute("SELECT to_regclass(%s) IS NOT NULL AS live",
+                        (f"public.{table}",))
+            if not cur.fetchone()["live"]:
+                continue        # never harvested on this machine; nothing to hold
+            cur.execute("SELECT to_regclass(%s) IS NOT NULL AS staged",
+                        (f"{stage}.{table}",))
+            if cur.fetchone()["staged"]:
+                continue        # postgres.sql already defines it
+            cur.execute(sql.SQL("CREATE TABLE {}.{} (LIKE public.{} INCLUDING ALL)")
+                        .format(_ident(stage), _ident(table), _ident(table)))
+            print(f"[build] staged {table} by cloning the live definition",
+                  file=sys.stderr)
         # The two big staging tables take their column TYPES from the real ones
         # (`AS SELECT … WHERE false`), so they cannot drift when postgres.sql
         # changes and COPY into them can never coerce a value differently from
@@ -1057,6 +1097,32 @@ def render_cards(conn, reader) -> dict:
                 "summary": r["summary"], "confidence": r["confidence"],
                 "fetched_at": r["fetched_at"]}
 
+    # Registry facts (NIRF ranks, state Fee Regulating Authority approved fees)
+    # and MakeMyEducation's own admission records. Both were being LOST here:
+    # render_card takes them as arguments, and this build never passed either,
+    # so a full rebuild silently stripped the registry lines out of every card
+    # it touched -- 336 colleges' worth of matched government data, gone with no
+    # error, because a card that is merely missing a paragraph still looks fine.
+    registry: dict[str, list] = {}
+    admission: dict[str, list] = {}
+    for table, sql, sink in (
+        ("registry_fact",
+         "SELECT college_id, registry, category, year, payload, source_url, "
+         "detail_url FROM registry_fact", registry),
+        ("college_admission",
+         "SELECT college_id, course_title, kind, payload FROM college_admission",
+         admission),
+    ):
+        try:
+            with conn.cursor() as cur:
+                cur.execute(sql)
+                for r in cur.fetchall():
+                    sink.setdefault(r["college_id"], []).append(dict(r))
+        except Exception as exc:  # noqa: BLE001 - table absent on a fresh store
+            conn.rollback()
+            print(f"[cards] {table} unavailable ({str(exc)[:60]}); "
+                  f"cards will omit it", file=sys.stderr)
+
     n = 0
     with conn.transaction(), conn.cursor() as wcur, \
             wcur.copy("COPY _cards (college_id, card) FROM STDIN") as cp:
@@ -1072,10 +1138,11 @@ def render_cards(conn, reader) -> dict:
                         "min_hostel_inr", "has_hostel")}
                     facts = {k: college.get(k) for k in CARD_FACT_KINDS
                              if college.get(k)}
+                    cid = college["college_id"]
                     cp.write_row((
-                        college["college_id"],
-                        db.render_card(college, agg, facts,
-                                       web.get(college["college_id"])),
+                        cid,
+                        db.render_card(college, agg, facts, web.get(cid),
+                                       registry.get(cid), admission.get(cid)),
                     ))
                     n += 1
 
@@ -1083,7 +1150,9 @@ def render_cards(conn, reader) -> dict:
         cur.execute("UPDATE college_agg a SET card = s.card FROM _cards s "
                     "WHERE s.college_id = a.college_id")
         cur.execute(_SEARCH_DOC)
-    return {"cards": n, "web_facts": sum(len(v) for v in web.values())}
+    return {"cards": n, "web_facts": sum(len(v) for v in web.values()),
+            "registry_colleges": len(registry),
+            "admission_colleges": len(admission)}
 
 
 # ---------------------------------------------------------------------------

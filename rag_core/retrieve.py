@@ -361,12 +361,19 @@ def _get_model():
                 from sentence_transformers import SentenceTransformer  # heavy: lazy
 
                 name = _embed_model_name()
+                # Same device probe the index build uses, so a query vector and
+                # the indexed vectors are produced by the same configuration.
+                # It falls back to CPU on any GPU trouble: a served query must
+                # degrade in latency, never fail.
+                from .index_build import pick_device
+                device = pick_device()
                 try:
                     # Cached model: skip the Hub online check, measured in
                     # seconds per process start.
-                    _model = SentenceTransformer(name, local_files_only=True)
+                    _model = SentenceTransformer(name, local_files_only=True,
+                                                 device=device)
                 except Exception:
-                    _model = SentenceTransformer(name)
+                    _model = SentenceTransformer(name, device=device)
     return _model
 
 

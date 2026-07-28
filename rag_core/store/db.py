@@ -170,7 +170,8 @@ def render_registry_lines(reg: list | None) -> list[str]:
 
 
 def render_card(college: dict, agg: dict | None = None, facts: dict | None = None,
-                web_facts: dict | None = None, registry: list | None = None) -> str:
+                web_facts: dict | None = None, registry: list | None = None,
+                admission: list | None = None) -> str:
     """The single retrieval unit: one college rendered as grounded prose.
 
     One college = one card (not one course) because students ask about
@@ -277,11 +278,82 @@ def render_card(college: dict, agg: dict | None = None, facts: dict | None = Non
                 f"MakeMyEducation; tell the student to confirm on the official site:")
             lines.extend(rendered)
 
+    lines.extend(render_admission_lines(admission))
+
     if is_abroad:
         lines.append(f"Location note: this is an overseas institution "
                      f"({college.get('country') or 'outside India'}).")
 
     return "\n".join(l for l in lines if l.strip())
+
+
+# Rendered per course, capped: a college with 40 programmes would otherwise
+# push everything else out of the generator's context window.
+MAX_ADMISSION_COURSES = 8
+
+
+def render_admission_lines(admission: list | None) -> list[str]:
+    """MakeMyEducation's own admission records, from `college_admission`.
+
+    Kept as its own block with its own attribution because it is a third tier:
+    not the course catalogue, not scraped from the college's site, but the
+    client's records — which are patchy enough that a student must be told to
+    confirm. See sources/admission_ingest.py for what was thrown away to get
+    here (72% of the source eligibility field was website navigation text).
+
+    Deliberately NOT rendered: admissionStatus and admissionMode. They read
+    "Open" and "Merit Based" on essentially every row in the country, so
+    printing them would manufacture a fact out of a schema default — and
+    "admissions are open" is precisely the claim a student would act on.
+    """
+    if not admission:
+        return []
+
+    by_course: dict[str, dict[str, dict]] = {}
+    for row in admission:
+        kind = row.get("kind")
+        payload = row.get("payload")
+        if isinstance(payload, str):
+            payload = _loads(payload, None)
+        if not kind or not isinstance(payload, dict):
+            continue
+        by_course.setdefault(str(row.get("course_title") or "").strip(),
+                             {})[kind] = payload
+
+    out: list[str] = []
+    # Courses carrying a qualifying mark first: it is the fact a student can
+    # actually check themselves against.
+    order = sorted(by_course.items(),
+                   key=lambda kv: (0 if "min_marks" in kv[1] else 1, kv[0]))
+    for title, kinds in order[:MAX_ADMISSION_COURSES]:
+        bits: list[str] = []
+        mm = kinds.get("min_marks")
+        if mm and mm.get("min_percent") is not None:
+            stage = mm.get("stage") or "qualifying exam"
+            bits.append(f"minimum {mm['min_percent']:g}% in {stage}")
+        af = kinds.get("accepted_from") or {}
+        if af.get("exams"):
+            bits.append("accepts " + ", ".join(af["exams"][:6]))
+        if af.get("boards"):
+            bits.append("boards: " + ", ".join(af["boards"][:6]))
+        q = kinds.get("qualification") or {}
+        if q.get("text"):
+            bits.append(str(q["text"])[:200])
+        d = kinds.get("documents") or {}
+        if d.get("text"):
+            bits.append("documents: " + str(d["text"])[:160])
+        if bits:
+            label = title or "General"
+            out.append(f"  - {label}: {'; '.join(bits)}.")
+
+    if not out:
+        return []
+    more = len(by_course) - len(out)
+    head = ("ADMISSION CRITERIA on record at MakeMyEducation — incomplete for "
+            "many colleges; tell the student to confirm with the college:")
+    if more > 0:
+        head = head[:-1] + f" (+{more} more programme(s) on record):"
+    return [head, *out]
 
 
 # ---------------------------------------------------------------------------
