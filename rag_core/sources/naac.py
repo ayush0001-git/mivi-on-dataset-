@@ -231,8 +231,11 @@ def run(*, dry_run: bool = False, refresh: bool = False,
 
     be = get_backend()
     now = datetime.now(timezone.utc)
-    stats = {"rows": len(rows), "matched": 0, "unmatched": 0, "no_city": 0}
-    writes: list[tuple] = []
+    stats = {"rows": len(rows), "matched": 0, "unmatched": 0, "no_city": 0,
+             "contested": 0, "contested_colleges": 0}
+    # college_id -> every NAAC row that claimed it. Contested colleges are
+    # dropped wholesale; see the comment at the resolution step.
+    claims: dict[str, list[tuple]] = {}
     misses: list[tuple] = []
     samples: list[str] = []
 
@@ -254,14 +257,57 @@ def run(*, dry_run: bool = False, refresh: bool = False,
         payload = {"grade": r["grade"], "cgpa": r["cgpa"], "cycle": r["cycle"],
                    "declared": r["declared"], "aishe_id": r["aishe_id"],
                    "as_on": AS_ON, "naac_category": r["category"]}
-        writes.append((college["college_id"], "naac",
-                       r["aishe_id"] or r["track_id"], "accreditation", AS_ON,
-                       json.dumps(payload), XLSX_URL, None,
-                       round(score, 3), why, now))
+        row = (college["college_id"], "naac",
+               r["aishe_id"] or r["track_id"], "accreditation", AS_ON,
+               json.dumps(payload), XLSX_URL, None,
+               round(score, 3), why, now)
+        # Claims are collected, not applied. Whether a claim is safe cannot be
+        # judged one row at a time: it depends on whether anything ELSE claims
+        # the same college. Resolved in one pass below.
+        claims.setdefault(college["college_id"], []).append(
+            (row, r["name"], r["grade"], city))
         if len(samples) < 14:
             samples.append(f"  {r['grade']:<4} {r['cgpa'] or '-':<5} "
                            f"{r['name'][:40]:40} -> {college['name'][:40]:40} "
                            f"({score:.2f})")
+
+    # ---- resolve contested colleges by REFUSING them ----------------------
+    # A college has exactly one NAAC grade. When two NAAC institutions both
+    # match one college, at least one is a wrong grade on a real college — and
+    # the higher score is NOT a safe tie-break. Measured on this workbook, 49
+    # colleges were contested by 117 rows and 38 of those disagreed on the
+    # grade, including cases where picking the top score is provably wrong:
+    #
+    #   ours: MRR College Of Pharmacy Nandigama
+    #     0.750 A   NRI COLLEGE OF PHARMACY      <- wrong
+    #     0.737 B++ SIMS COLLEGE OF PHARMACY     <- also wrong
+    #   ours: Government First Grade College Hosadurga
+    #     0.857 B+ (2.64) GOVERNMENT FIRST GRADE COLLEGE
+    #     0.857 B  (2.33) GOVERNMENT FIRST GRADE COLLEGE   <- tied, disagreeing
+    #
+    # Karnataka alone has hundreds of colleges named exactly "Government First
+    # Grade College", one per town, and a NAAC row that omits the town cannot be
+    # assigned to any of them. Every name gate passes because the names are
+    # identical; identical generic names are precisely the case where a score
+    # carries no information.
+    #
+    # So a contested college gets NO grade. Telling a student their college is
+    # B+ when it is C is worse than telling them nothing, and this is the one
+    # decision where the safe answer is silence.
+    writes: list[tuple] = []
+    for cid, group in claims.items():
+        if len(group) == 1:
+            writes.append(group[0][0])
+            continue
+        stats["contested_colleges"] += 1
+        stats["contested"] += len(group)
+        grades = sorted({g[2] for g in group})
+        for row, nm, grade, city in group:
+            misses.append((
+                "naac", f"contested:{row[2]}", "accreditation", AS_ON, nm, city,
+                None, row[8],
+                f"{len(group)} NAAC institutions matched the same college "
+                f"({grades}) — refused rather than guessed"))
 
     for s in samples:
         print(s, file=sys.stderr)
@@ -271,9 +317,23 @@ def run(*, dry_run: bool = False, refresh: bool = False,
           f"{stats['no_city']:,} had no recoverable city"
           + ("  (DRY RUN — nothing written)" if dry_run else ""),
           file=sys.stderr)
+    if stats["contested_colleges"]:
+        print(f"[naac] REFUSED {stats['contested_colleges']:,} colleges claimed by "
+              f"{stats['contested']:,} competing NAAC rows — a contested grade is "
+              f"a coin flip, so none is stored. {len(writes):,} colleges will be "
+              f"written", file=sys.stderr)
 
     if dry_run:
         return stats
+
+    # Clean replace, not an upsert. Everything here is re-derived from the
+    # workbook, and an upsert alone would strand grades that this run now
+    # REFUSES — the contested colleges would silently keep the coin-flip grade a
+    # previous run wrote, which is the exact failure the refusal exists to stop.
+    removed = be.execute("DELETE FROM registry_fact WHERE registry = 'naac'")
+    if removed:
+        print(f"[naac] cleared {removed:,} grades from the previous run",
+              file=sys.stderr)
 
     be.executemany(
         "INSERT INTO registry_fact (college_id, registry, ref_id, category, "
