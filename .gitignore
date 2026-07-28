@@ -2,6 +2,25 @@
 __pycache__/
 *.pyc
 .env
+
+# Derived corpus — rebuilt from source, never committed.
+# mivi.db is ~360 MB and index.npz ~57 MB; both regenerate from the courses
+# export plus the API crawl (build_db ~25s; index_build is incremental).
+# Committing them would bloat the repo with data that goes stale immediately.
+data/mivi.db
+data/mivi.db-shm
+data/mivi.db-wal
+data/mivi.build.db*
 data/index.npz
 data/answer_cache.json
+
+# Crawler output: large JSONL, re-fetchable from the live API.
+data/raw/
+
+# Retired prototype artifacts, kept locally for reference only.
+data/deprecated/
+
 metrics/metrics.jsonl
+
+# Run logs, including the nightly crawler's. Local diagnostics, not history.
+logs/
