@@ -1,13 +1,20 @@
-# Core pipeline (answer.py / run_all.py / evals)
-sentence-transformers>=2.7
-numpy>=1.26
-openai>=1.30
+# --- Corpus build -----------------------------------------------------------
+# httpx: async client for the MakeMyEducation API crawl. Chosen over requests
+# because resolving ~35k colleges needs connection pooling and concurrency —
+# a serial requests loop spends most of its wall-clock in TLS handshakes.
+httpx>=0.27
+# The store itself is stdlib sqlite3 (+ FTS5 for BM25) — no server to provision.
+
+# --- Retrieval --------------------------------------------------------------
+sentence-transformers>=2.7   # local multilingual embeddings (EN / Hindi / Hinglish)
+numpy>=1.26                  # dense index: ~35k x 384 float32 matrix
+
+# --- Generation -------------------------------------------------------------
+openai>=1.30                 # any OpenAI-compatible endpoint (Groq primary, Gemini failover)
 python-dotenv>=1.0
 
-# Optional demo UI (uvicorn app:app --port 8000)
+# --- Serving ----------------------------------------------------------------
 fastapi>=0.110
-uvicorn>=0.29
+uvicorn[standard]>=0.29
 pydantic>=2.6
-
-# Optional web mode (rag_core/webmode.py, demo UI only)
-requests>=2.31
+requests>=2.31               # webmode (Firecrawl) only
