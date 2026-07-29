@@ -1147,7 +1147,33 @@ def render_cards(conn, reader) -> dict:
     # beats avoiding the duplication. Both read registry_fact; neither invents.
     #
     # DISTINCT ON keeps one row per college: a college with an approved fee for
-    # both ENGG and MBA has two, and the lower is the safer one to show.
+    # both ENGG and MBA has two, and this ORDER BY decides which.
+    #
+    # It MUST stay the same rule as fee_promote._session_start + its rank key,
+    # because both write colleges.verified_fee_* and whichever runs last wins.
+    # This clause used to be `ORDER BY college_id, amt ASC` — lowest fee of any
+    # year — so a build running after a promote silently reverted 196 colleges
+    # onto a rule that ignores the session, some of them onto fees fixed in
+    # 2021-22. Kept identical here, in the same order and for the same reasons:
+    #
+    #   session DESC  the newest approved fee, reading the session as the
+    #                 effective-from date the authority states
+    #   amt ASC       then the lowest, since quoting a college's M.Pharmacy fee
+    #                 overstates what most of its students pay
+    #   category, registry   so nothing is left for heap order to decide
+    #
+    # substring() rather than LEFT(): year is TEXT and the adapters disagree on
+    # its shape ('2024-25' vs '2024-2025'), so only the opening year compares
+    # across them. NULLS LAST puts an unparseable session oldest, matching
+    # fee_promote's -1, so it can never outrank a real one.
+    #
+    # COLLATE "C" on the name tie-break, because "same rule" has to mean the
+    # same ORDER too. The database's default collation is locale-aware and
+    # sorts 'Master of Computer Application' before 'MBA / PGDM' (case and
+    # punctuation are ignored at the primary level); Python's `<` compares
+    # codepoints and puts 'MBA / PGDM' first. Two colleges tie on both session
+    # and fee, and picked a different course here than in fee_promote until
+    # this collation was pinned. "C" is byte order, which is what Python does.
     try:
         with conn.transaction(), conn.cursor() as cur:
             cur.execute("""
@@ -1165,13 +1191,17 @@ def render_cards(conn, reader) -> dict:
                                  (payload->>'approved_total_inr')::BIGINT) AS amt,
                         year,
                         'Fee Regulating Authority approved tuition'
-                          || COALESCE(' [' || (payload->>'stream') || ']', '') AS label,
+                          || COALESCE(' [' || COALESCE(payload->>'stream',
+                                                       category) || ']', '') AS label,
                         source_url, fetched_at
                     FROM registry_fact
-                    WHERE registry LIKE 'fra%'
+                    WHERE registry ILIKE 'fra%'
                       AND COALESCE(payload->>'approved_tuition_inr',
                                    payload->>'approved_total_inr') IS NOT NULL
-                    ORDER BY college_id, amt ASC
+                    ORDER BY college_id,
+                             substring(year from '[0-9]{4}')::INT DESC NULLS LAST,
+                             amt ASC,
+                             category COLLATE "C", registry COLLATE "C"
                 ) s
                 WHERE c.college_id = s.college_id""")
             promoted = cur.rowcount

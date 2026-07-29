@@ -193,3 +193,46 @@ superlative citation edge cases, CORS headers absent on 500 responses, one
 `superlatives()` query that re-runs its prefilter three times.
 
 Nothing is committed to git yet — ~17,000 lines live only on disk.
+
+## Field-level coverage — the next phase (29 Jul 2026)
+
+Two tables now exist and are the foundation for everything that follows:
+
+`college_priority` — all 38,700 colleges scored and split into three tiers by
+likely student demand (NIRF +40, NAAC +25, course count +30, website +10,
+popular course +15). Tier 1 = 863 colleges, tier 2 = 12,167, tier 3 = 25,670.
+Crawl in that order: only 166 tier-1 colleges lack a fee, against 18,508 in
+tier 3, so the effort/return ratio differs by two orders of magnitude.
+**This is a PROXY.** The client's website analytics hold real search counts;
+when that export arrives, rebuild the tiers from it and delete this note.
+
+`college_field` — one row per (college, field, source) with source_url,
+stated_year, fetched_at and confidence. 8,319 rows backfilled from NAAC, NIRF,
+FRA and the web harvest. This is what makes targeted refresh possible:
+
+    SELECT college_id, field FROM college_field
+    WHERE fetched_at < now() - interval '180 days'
+
+Nightly should read THAT rather than re-crawling the corpus.
+
+### What is actually missing, measured against the client's 11-category spec
+
+EIGHT categories have no columns at all — geo lat/long, campus size, approvals
+(AICTE/UGC), seats/intake, placement %, packages, recruiters, facilities,
+gallery, brochure URL, social links, cutoffs, scholarships. Extract nothing for
+these until the schema exists; there is nowhere to put it.
+
+Columns that exist and are empty: pincode 0%, phone/email 0.1%,
+affiliated_university 0%, logo/banner 6%, website_url 57.5%, establish_year 83%.
+
+FREE WIN, do this first: `naac_grade` and `nirf_ranking` read 0% on the
+`colleges` table while 2,504 NAAC grades and 264 NIRF ranks already sit in
+`registry_fact`. That is a promotion, not a crawl.
+
+### Honest ceiling
+
+8,319 tracked fields against roughly 7.7 lakh possible (38,700 x ~20). Placement
+packages, cutoffs and recruiters are simply not published by most of the 25,670
+tier-3 colleges — small local institutions with no website. Crawl tier 1 hard,
+expect tier 3 to stay largely empty, and leave it empty rather than filling it
+with numbers nobody published.
