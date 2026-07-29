@@ -196,6 +196,41 @@ GAP_DDL = (
     # absent from staging — which crashed a build: the existence probe found the
     # column in `public` while the SELECT ran against the staging schema.
     "ALTER TABLE college_web_facts ADD COLUMN IF NOT EXISTS stated_year TEXT",
+
+    # The client's directory spec, categories that had nowhere to be stored.
+    # Added here rather than in postgres.sql because THIS is the list the
+    # staging build replays: a column that exists only in `public` is destroyed
+    # by the next atomic swap, silently, which already cost this project three
+    # tables today.
+    #
+    # Scalars live on `colleges`; the one-to-many parts (facilities, recruiters,
+    # gallery) are JSONB rather than child tables because they are read as a
+    # whole, never joined or aggregated.
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS latitude DOUBLE PRECISION",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS longitude DOUBLE PRECISION",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS campus_size TEXT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS approvals JSONB",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS accreditations JSONB",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS facilities JSONB",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS gallery_urls JSONB",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS brochure_url TEXT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS video_url TEXT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS social_links JSONB",
+    # Placement figures carry the YEAR they describe, always. A placement rate
+    # or package with no year is the same trap as an undated fee: it reads as
+    # current and is quoted as current.
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS placement_pct REAL",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS placement_year TEXT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS package_highest_inr BIGINT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS package_average_inr BIGINT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS package_median_inr BIGINT",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS top_recruiters JSONB",
+    "ALTER TABLE colleges ADD COLUMN IF NOT EXISTS placement_source TEXT",
+    # Per-course, so they belong on `courses`.
+    "ALTER TABLE courses ADD COLUMN IF NOT EXISTS total_seats INTEGER",
+    "ALTER TABLE courses ADD COLUMN IF NOT EXISTS study_mode TEXT",
+    "ALTER TABLE courses ADD COLUMN IF NOT EXISTS duration_years REAL",
+    "ALTER TABLE courses ADD COLUMN IF NOT EXISTS fees_by_category JSONB",
 )
 
 
