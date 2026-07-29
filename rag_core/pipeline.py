@@ -424,6 +424,21 @@ Hard rules:
     table as though it were our tuition data, and never use it to contradict a
     verified figure — if the two disagree, say so plainly and give both.
 
+15. WHEN THE STUDENT HAS GIVEN YOU NOTHING TO GO ON, ASK — AND NAME NO COLLEGE.
+If the question states no course, no place, no budget and no marks ("help me
+choose a college", "kaha admission lu"), the only useful reply is a short warm
+question asking for one or two of those. Do NOT name colleges as examples. The
+records in CONTEXT are then just the top of an unfiltered corpus of 38,700, and
+naming any of them tells the student nothing about themselves: observed live,
+this produced "I can share details on institutions like A.S.E. College of
+Education in Bhopal or Christ Academy Institute of Law in Bangalore" for a
+student who had said only "help me choose a college". Two arbitrary colleges in
+two unrelated cities and two unrelated fields — a human counsellor would ask
+what the student wants to study first, and so must you. Keep answered=true with
+an empty citations list: asking the opening question IS engaging with the
+student, not refusing them, and `answered=false` is reserved for "I looked and
+the record does not support an answer".
+
 Citations discipline: cite ONLY the colleges that form part of your actual
 answer. For budget/eligibility questions, cite only colleges that satisfy the
 stated constraints — never cite a college that fails them (you may say that
@@ -852,6 +867,27 @@ def _superlative_violations(result, question, sup):
     return [f"the answer does not name {name!r}, which SQL computed as "
             f"#1 for {label!r} over the whole matching set — a superlative "
             f"answer must name the computed winner, not the first CONTEXT card"]
+
+
+def _names_any_college(answer: str, hits) -> bool:
+    """Does the answer mention any retrieved college by name?
+
+    Matches on the distinctive head of each name, the same way
+    _superlative_violations does: catalogue names carry long tails an answer has
+    no reason to repeat.
+    """
+    low = (answer or "").lower()
+    if not low:
+        return False
+    for h in (hits or []):
+        head = re.split(r"[,(]", str(h.get("name") or ""))[0].strip()
+        words = [w for w in re.findall(r"[A-Za-z][\w.'-]{2,}", head)
+                 if w.lower() not in {"college", "university", "institute",
+                                      "school", "the", "and", "of", "for",
+                                      "government", "national", "centre"}]
+        if words and all(w.lower() in low for w in words[:2]):
+            return True
+    return False
 
 
 def _computed_facts(hits, sup=None, total=None):
@@ -2269,6 +2305,16 @@ def answer_question(question, history=None, known_profile=None):
                 "answered": bool(result.get("answered")),
                 "reason_if_unanswered": result.get("reason_if_unanswered"),
             }
+            # An answer that names NO college cannot have sources for a claim it
+            # never makes. The clarifying reply to "help me choose a college" is
+            # exactly this shape — it asks what the student wants to study — and
+            # the model still attached nine ids to it. Citations there are noise
+            # at best and, in a UI that renders them as "sources", an implied
+            # recommendation of nine arbitrary colleges the student never asked
+            # about. Narrow on purpose: only fires when not one retrieved
+            # college's name appears in the answer.
+            if result["citations"] and not _names_any_college(result["answer"], hits):
+                result["citations"] = []
         except Exception as e:
             print(f"[generation error, attempt {attempt + 1}] {e}", file=sys.stderr)
             messages.append({"role": "user", "content":

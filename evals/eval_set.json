@@ -800,7 +800,7 @@
     },
     {
       "id": "absence-naac-grade",
-      "question": "What NAAC grade does Doon University have?",
+      "question": "What NAAC grade does Bidhan Chandra College Asansol have?",
       "kind": "absence",
       "filters_expected": {
         "include_abroad": false
@@ -832,7 +832,7 @@
       ],
       "truth_sql": "SELECT COUNT(*) FROM colleges WHERE college_id='69e9f89f66da7e885cde7738' AND naac_grade IS NOT NULL AND TRIM(naac_grade)<>''",
       "truth_value": 0,
-      "notes": "naac_grade EXISTS as a column in schema.sql but the API returns an empty string for it on 1,516/1,516 crawled colleges. A declared-but-empty column is more dangerous than a missing one: the ETL will happily write '' and the card renderer must then decline to emit a NAAC line at all. Scoped to THIS college: the corpus-wide count is not a safe proxy — the enrichment crawl has since written exactly one naac_grade (Kings College London, \"A++\", itself a source data error since NAAC is an Indian body), which would fail a global assertion while saying nothing about this college."
+      "notes": "naac_grade EXISTS as a column in schema.sql but the API returns an empty string for it on 1,516/1,516 crawled colleges. A declared-but-empty column is more dangerous than a missing one: the ETL will happily write '' and the card renderer must then decline to emit a NAAC line at all. Scoped to THIS college: the corpus-wide count is not a safe proxy — the enrichment crawl has since written exactly one naac_grade (Kings College London, \"A++\", itself a source data error since NAAC is an Indian body), which would fail a global assertion while saying nothing about this college. | Re-pointed 28 Jul 2026. This case originally asked about Doon University / IIT Delhi, which had NO registry data when it was written. The NAAC and NIRF ingests changed that — MIVI now correctly answers both with real, dated figures, so the old case was testing the corpus's emptiness rather than MIVI's honesty. Re-pointed at a college that genuinely has no registry fact, which preserves what the case is FOR: does MIVI admit an absence instead of inventing a grade?"
     },
     {
       "id": "absence-mbbs-at-aiims-rishikesh",
@@ -873,7 +873,7 @@
     },
     {
       "id": "absence-nirf-ranking",
-      "question": "What is IIT Delhi's NIRF ranking?",
+      "question": "What is the NIRF ranking of Evening College Saharsa?",
       "kind": "absence",
       "filters_expected": {
         "include_abroad": false
@@ -904,7 +904,7 @@
       ],
       "truth_sql": "SELECT COUNT(*) FROM colleges WHERE nirf_ranking IS NOT NULL AND TRIM(nirf_ranking)<>''",
       "truth_value": 2,
-      "notes": "Same declared-but-empty trap as NAAC (nirfRanking is '' on 1,516/1,516 crawled colleges), on the institution whose NIRF rank is the most memorised number in Indian admissions. If any absence case leaks outside knowledge, it will be this one."
+      "notes": "Same declared-but-empty trap as NAAC (nirfRanking is '' on 1,516/1,516 crawled colleges), on the institution whose NIRF rank is the most memorised number in Indian admissions. If any absence case leaks outside knowledge, it will be this one. | Re-pointed 28 Jul 2026. This case originally asked about Doon University / IIT Delhi, which had NO registry data when it was written. The NAAC and NIRF ingests changed that — MIVI now correctly answers both with real, dated figures, so the old case was testing the corpus's emptiness rather than MIVI's honesty. Re-pointed at a college that genuinely has no registry fact, which preserves what the case is FOR: does MIVI admit an absence instead of inventing a grade?"
     },
     {
       "id": "abroad-mba-under-50k",
