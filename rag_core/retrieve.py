@@ -296,9 +296,17 @@ def _where(f: dict) -> tuple[str, list]:
         clauses.append("a.has_hostel")
 
     if f.get("entrance_exam"):
-        # college_agg.entrance_exams is a JSON array of strings; a LIKE over the
-        # serialised array is an adequate containment test and needs no json1.
-        clauses.append("a.entrance_exams ILIKE ? ESCAPE '\\'")
+        # entrance_exams is JSONB in Postgres, and jsonb has no LIKE/ILIKE
+        # operator at all: this clause raised
+        #   operator does not exist: jsonb ~~* unknown
+        # and killed the whole query, so every "colleges that accept JEE Main"
+        # question failed rather than filtering. Under SQLite the column was
+        # TEXT holding a serialised array, which is why a plain LIKE was written
+        # here and why the comment above it said json1 was not needed.
+        #
+        # Cast to text and match case-insensitively: the same containment test
+        # the original intended, expressed in a way jsonb supports.
+        clauses.append("a.entrance_exams::text ILIKE ? ESCAPE '\\'")
         params.append(_like(f["entrance_exam"]))
 
     # TRUE, not 1. SQLite treated `WHERE 1` as truthy; Postgres rejects it with

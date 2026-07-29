@@ -489,6 +489,101 @@ _gazetteer: dict | None = None
 _gazetteer_lock = threading.Lock()
 
 
+# DEVANAGARI -> the Latin the rest of the router already understands.
+#
+# The heuristic router normalises with re.sub(r'[^a-z0-9]+', ' ', q), which
+# deletes every Devanagari character — so a question written in Hindi arrived at
+# the place matcher as an empty string. Measured with evals/script_parity.py on
+# six question shapes:
+#
+#     same filters across scripts  0/6
+#     english     {'state': 'Punjab', 'course_terms': ['btech'], 'max_tuition_inr': 150000}
+#     hinglish    {'state': 'Punjab', 'course_terms': ['btech'], 'max_tuition_inr': 150000}
+#     devanagari  {}          <- every group, every filter
+#
+# English and Hinglish agreed perfectly; Devanagari extracted NOTHING, so a
+# student writing in Hindi was answered with no state, no course and no budget
+# applied at all.
+#
+# This is a fixed gazetteer, not transliteration. Rule-based transliteration was
+# tried and rejected during the architecture review: it produces "uttarAkhaMDa"
+# and "uttarākhaṃḍa", which match zero rows in the live tsvector. A bounded
+# table of the names students actually type is smaller, exact, and auditable.
+_DEVANAGARI_TERMS: dict[str, str] = {
+    # States and union territories
+    "उत्तराखंड": "uttarakhand", "उत्तराखण्ड": "uttarakhand",
+    "उत्तर प्रदेश": "uttar pradesh", "मध्य प्रदेश": "madhya pradesh",
+    "हिमाचल प्रदेश": "himachal pradesh", "अरुणाचल प्रदेश": "arunachal pradesh",
+    "आंध्र प्रदेश": "andhra pradesh", "आन्ध्र प्रदेश": "andhra pradesh",
+    "महाराष्ट्र": "maharashtra", "कर्नाटक": "karnataka", "केरल": "kerala",
+    "तमिलनाडु": "tamil nadu", "तमिल नाडु": "tamil nadu",
+    "पश्चिम बंगाल": "west bengal", "बंगाल": "west bengal",
+    "राजस्थान": "rajasthan", "गुजरात": "gujarat", "पंजाब": "punjab",
+    "हरियाणा": "haryana", "बिहार": "bihar", "झारखंड": "jharkhand",
+    "ओडिशा": "odisha", "उड़ीसा": "odisha", "छत्तीसगढ़": "chhattisgarh",
+    "असम": "assam", "तेलंगाना": "telangana", "गोवा": "goa",
+    "जम्मू": "jammu", "कश्मीर": "kashmir", "लद्दाख": "ladakh",
+    "दिल्ली": "delhi", "चंडीगढ़": "chandigarh", "पुडुचेरी": "puducherry",
+    "सिक्किम": "sikkim", "मणिपुर": "manipur", "मेघालय": "meghalaya",
+    "मिजोरम": "mizoram", "नागालैंड": "nagaland", "त्रिपुरा": "tripura",
+    # Cities students name most often
+    "देहरादून": "dehradun", "मुंबई": "mumbai", "बेंगलुरु": "bengaluru",
+    "बैंगलोर": "bangalore", "चेन्नई": "chennai", "कोलकाता": "kolkata",
+    "हैदराबाद": "hyderabad", "पुणे": "pune", "जयपुर": "jaipur",
+    "लखनऊ": "lucknow", "कानपुर": "kanpur", "इंदौर": "indore",
+    "भोपाल": "bhopal", "नागपुर": "nagpur", "पटना": "patna",
+    "रांची": "ranchi", "रायपुर": "raipur", "गुवाहाटी": "guwahati",
+    "अहमदाबाद": "ahmedabad", "सूरत": "surat", "वाराणसी": "varanasi",
+    "प्रयागराज": "prayagraj", "आगरा": "agra", "मेरठ": "meerut",
+    "लुधियाना": "ludhiana", "अमृतसर": "amritsar", "नोएडा": "noida",
+    "गुड़गांव": "gurugram", "गुरुग्राम": "gurugram", "फरीदाबाद": "faridabad",
+    "हरिद्वार": "haridwar", "रुड़की": "roorkee", "नैनीताल": "nainital",
+    "कोच्चि": "kochi", "तिरुवनंतपुरम": "thiruvananthapuram",
+    "कोट्टायम": "kottayam", "विशाखापत्तनम": "visakhapatnam",
+    "तिरुपति": "tirupati", "मैसूर": "mysuru", "कोयंबटूर": "coimbatore",
+    # Courses
+    "बीटेक": "btech", "बी.टेक": "btech", "इंजीनियरिंग": "engineering",
+    "एमबीबीएस": "mbbs", "एमबीए": "mba", "बीबीए": "bba", "बीसीए": "bca",
+    "एमसीए": "mca", "बीएससी": "b.sc", "बीकॉम": "b.com", "बीएड": "b.ed",
+    "नर्सिंग": "nursing", "फार्मेसी": "pharmacy", "कानून": "law",
+    "एलएलबी": "llb", "डिप्लोमा": "diploma", "डिजाइन": "design",
+    "पॉलिटेक्निक": "polytechnic", "कॉलेज": "college",
+    # Money units and the words that carry intent
+    "लाख": "lakh", "करोड़": "crore", "हज़ार": "thousand", "हजार": "thousand",
+    "डेढ़": "1.5", "ढाई": "2.5", "सवा": "1.25",
+    "सबसे": "sabse", "सस्ता": "sasta", "सस्ती": "sasta",
+    "पुराना": "purana", "पुरानी": "purana", "नया": "naya",
+    "सरकारी": "sarkari", "निजी": "private", "प्राइवेट": "private",
+    "छात्रावास": "hostel", "हॉस्टल": "hostel",
+    "कितने": "kitne", "कौन": "kaun", "कौनसा": "kaunsa", "कौन सा": "kaunsa",
+    "अच्छा": "accha", "बेहतर": "better", "फीस": "fees",
+}
+
+# Longest first, so "उत्तर प्रदेश" is consumed before "उत्तराखंड" can partially
+# match and before the single word "प्रदेश" means anything.
+_DEVANAGARI_ORDER = sorted(_DEVANAGARI_TERMS, key=len, reverse=True)
+_HAS_DEVANAGARI = re.compile(r"[ऀ-ॿ]")
+
+
+def _fold_devanagari(question: str) -> str:
+    """Append Latin equivalents for any Devanagari the router would otherwise
+    discard. APPENDS rather than replaces: the original text still reaches the
+    embedder and the lexical arm, which handle Devanagari on their own."""
+    if not _HAS_DEVANAGARI.search(question or ""):
+        return question
+    # Matched spans are CONSUMED, longest first, so a shorter term hiding
+    # inside a longer one cannot also fire: "बीबीए" (bba) is literally a
+    # substring of "एमबीबीएस" (mbbs), and without this "how many colleges
+    # offer MBBS" extracted course_terms ['mbbs', 'bba'] and filtered on both.
+    scratch = question
+    found: list[str] = []
+    for term in _DEVANAGARI_ORDER:
+        if term in scratch:
+            found.append(_DEVANAGARI_TERMS[term])
+            scratch = scratch.replace(term, " ")
+    return f"{question} {' '.join(found)}" if found else question
+
+
 def _load_gazetteer() -> dict:
     global _gazetteer
     if _gazetteer is None:
@@ -527,7 +622,9 @@ def _heuristic_route(question):
     wrong college. Matching the exact place names the corpus contains is a
     lookup, not a guess; word boundaries keep "Ara" out of "separate".
     """
-    q = question.lower()
+    # Fold Devanagari to Latin FIRST: everything below normalises with
+    # [^a-z0-9], which would otherwise delete the entire question.
+    q = _fold_devanagari(question).lower()
     filters, terms, note = {}, [], None
     m = re.search(r"(\d+(?:\.\d+)?)\s*(crore|cr\b)", q)
     amount = int(float(m.group(1)) * 10_000_000) if m else None
