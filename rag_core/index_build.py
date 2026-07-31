@@ -603,12 +603,13 @@ def main(argv=None) -> int:
                    help="embed only the first N cards (smoke test; marks the "
                         "index partial)")
     p.add_argument("--batch-size", type=int, default=DEFAULT_BATCH)
+    p.add_argument("--model", type=str, default=EMBED_MODEL, help="embedding model name")
     p.add_argument("--db", type=Path, default=None, help="corpus sqlite path")
     p.add_argument("--out", type=Path, default=None, help="output .npz path")
     a = p.parse_args(argv)
     try:
         stats = build_index(rebuild=a.rebuild, limit=a.limit, db_path=a.db,
-                            out_path=a.out, batch_size=a.batch_size)
+                            out_path=a.out, batch_size=a.batch_size, embed_model=a.model)
     except IndexBuildError as e:
         print(f"[index] {e}", file=sys.stderr)
         return 2

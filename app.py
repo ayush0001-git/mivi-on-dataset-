@@ -341,6 +341,10 @@ def _health_payload() -> dict[str, Any]:
         "concurrency": {"limit": MAX_CONCURRENCY,
                         "inflight": service.metrics.inflight,
                         "queue_timeout_s": QUEUE_TIMEOUT_S},
+        "llm": {
+            "primary": bool(os.getenv("GROQ_API_KEY") or os.getenv("OPENAI_API_KEY")),
+            "fallback": bool(os.getenv("FALLBACK_API_KEY"))
+        },
         "sessions": service.sessions.stats(),
         "answer_cache": service.answer_cache.stats(),
     }
@@ -465,7 +469,7 @@ class AnswerRequest(BaseModel):
     """The pre-existing contract. Kept byte-compatible on purpose: the demo UI
     and any integration built against it keep working through this rewrite."""
     question: str = Field(max_length=MAX_MESSAGE_CHARS)
-    mode: str = "db"                    # "db" | "web"
+    mode: str = "db"                    # "db" | "web" | "deep_research"
     prefs: dict[str, Any] | None = None
     history: list[dict[str, Any]] | None = None
     known_profile: dict[str, Any] | None = None
@@ -539,11 +543,11 @@ def _resolve_citations(citations: list[str] | None) -> list[dict[str, Any]]:
 # Routes
 # ---------------------------------------------------------------------------
 def _answer_sync(question: str, history: list[dict] | None,
-                 profile: dict[str, Any] | None) -> dict[str, Any]:
+                 profile: dict[str, Any] | None, session_id: str | None = None) -> dict[str, Any]:
     """The one place the blocking pipeline is called. Runs on a worker thread."""
     from rag_core.pipeline import answer_question  # late import: heavy module
 
-    return answer_question(question, history=history, known_profile=profile)
+    return answer_question(question, history=history, known_profile=profile, session_id=session_id)
 
 
 @app.post("/api/chat")
@@ -569,14 +573,28 @@ async def chat(req: ChatRequest, request: Request):
     # (and may be personalised with the student's name), and a cache key that
     # does not include the transcript would serve one conversation's answer
     # into another's context.
-    cache_key = service.answer_cache_key(message, profile) if not snap.history else None
-    result = service.answer_cache.get(cache_key) if cache_key else None
-    cached = result is not None
-    request.state.cache_hit = cached
 
-    if not cached:
+    sem_cache_result = service.semantic_cache.get(message, profile) if not snap.history else None
+    if sem_cache_result:
+        result = sem_cache_result
+        cached = True
+        request.state.cache_hit = True
+    else:
+        cached = False
+        request.state.cache_hit = False
         try:
-            result = await _run_blocking(_answer_sync, message, snap.history, profile)
+
+            result = await _run_blocking(_answer_sync, message, snap.history, profile, snap.session_id)
+            
+            if result.get("switch_to_mode") == "web":
+                log.info("Switching to web mode fallback for session=%s", snap.session_id)
+                from rag_core.webmode import web_answer
+                result = await _run_blocking(web_answer, message, None)
+            elif result.get("switch_to_mode") == "deep_research":
+                log.info("Switching to deep_research fallback for session=%s", snap.session_id)
+                from rag_core.deep_research import deep_research
+                result = await _run_blocking(deep_research, message, None)
+
         except HTTPException:
             raise
         except Exception as exc:  # noqa: BLE001 - provider/model failure
@@ -588,8 +606,8 @@ async def chat(req: ChatRequest, request: Request):
             ) from exc
         # Only grounded, answered results are cached. Caching a failure would
         # pin a transient provider outage in place for the whole TTL.
-        if cache_key and result.get("answered"):
-            service.answer_cache.put(cache_key, service.project_answer(result))
+        if not snap.history and result.get("answered"):
+            service.semantic_cache.put(message, profile, service.project_answer(result))
 
     answer_text = str(result.get("answer", ""))
     profile_out = service.sanitize_profile(result.get("profile") or profile)
@@ -622,21 +640,29 @@ async def api_answer(req: AnswerRequest, request: Request):
                 "answered": False, "reason_if_unanswered": "Empty question."}
 
     if req.mode == "web":
-        try:
-            from rag_core.webmode import web_answer
-        except Exception as exc:  # noqa: BLE001 - optional side path
-            raise HTTPException(status_code=503,
-                                detail="Web mode is not available on this deployment.") from exc
+        # The demo UI has a 'search the web instead' button. Never mixes
+        # its answers with the curated database path.
+        from rag_core.webmode import web_answer
         return await _run_blocking(web_answer, question, req.prefs)
+    elif req.mode == "deep_research":
+        from rag_core.deep_research import deep_research
+        return await _run_blocking(deep_research, question, req.prefs)
 
     await _require_corpus()
     # History is client-supplied here (this endpoint is stateless by design);
     # trim it so an oversized transcript cannot be used to inflate prompt cost.
     history = [m for m in (req.history or []) if isinstance(m, dict)][-12:]
     try:
-        return await _run_blocking(_answer_sync, question, history or None,
+        result = await _run_blocking(_answer_sync, question, history or None,
                                    service.sanitize_profile(req.known_profile)
                                    if req.known_profile is not None else None)
+        if result.get("switch_to_mode") == "web":
+            from rag_core.webmode import web_answer
+            result = await _run_blocking(web_answer, question, req.prefs)
+        elif result.get("switch_to_mode") == "deep_research":
+            from rag_core.deep_research import deep_research
+            result = await _run_blocking(deep_research, question, req.prefs)
+        return result
     except HTTPException:
         raise
     except Exception as exc:  # noqa: BLE001
@@ -670,6 +696,35 @@ async def metrics():
     snap["cache"] = service.answer_cache.stats()
     snap["sessions"] = service.sessions.stats()
     return snap
+
+
+class FeedbackPayload(BaseModel):
+    session_id: str
+    rating: int  # e.g., 1 for thumbs up, -1 for thumbs down
+    question: str = ""
+    answer: str = ""
+    comment: str = ""
+
+@app.post("/api/feedback")
+async def feedback(payload: FeedbackPayload, request: Request):
+    """Thumbs up/down feedback collection for the UI."""
+    _enforce_ip_limit(request)
+    service.feedback_store.append(
+        session_id=payload.session_id,
+        rating=payload.rating,
+        question=payload.question,
+        answer=payload.answer,
+        comment=payload.comment
+    )
+    
+    if payload.rating < 0:
+        import threading
+        from rag_core.analytics import categorize_failure
+        threading.Thread(target=categorize_failure, 
+                         args=(payload.question, payload.answer, payload.comment), 
+                         daemon=True).start()
+                         
+    return {"status": "ok"}
 
 
 @app.get("/api/college/{college_id}")
@@ -762,6 +817,81 @@ async def end_session(session_id: str):
     if not service.valid_session_id(session_id):
         raise HTTPException(status_code=404, detail="Unknown session.")
     return {"dropped": service.sessions.drop(session_id)}
+
+
+
+from fastapi.responses import StreamingResponse
+import asyncio
+import json
+
+async def _answer_streaming(question, history, profile):
+    """Async wrapper around chat() that yields tokens."""
+    from rag_core.pipeline import _prepare_generation
+    from rag_core import config
+    from openai import AsyncOpenAI
+    
+    prep = _prepare_generation(question, history, profile)
+    if "fast_return" in prep:
+        yield prep["fast_return"].get("answer", "")
+        return
+        
+    messages = prep["messages"]
+    
+    client = AsyncOpenAI(
+        base_url=config.LLM_BASE_URL,
+        api_key=config.LLM_API_KEY,
+        timeout=config.LLM_TIMEOUT
+    )
+    
+    stream = await client.chat.completions.create(
+        model=config.GEN_MODEL,
+        messages=messages,
+        stream=True,
+        temperature=0.0,
+        max_tokens=1400
+    )
+    
+    buffer = ""
+    async for chunk in stream:
+        if chunk.choices and chunk.choices[0].delta and chunk.choices[0].delta.content:
+            buffer += chunk.choices[0].delta.content
+            # Buffer until we have a complete sentence or 50 chars
+            if len(buffer) >= 50 or buffer.endswith(('.', '!', '?', '\n')):
+                yield buffer
+                buffer = ""
+    if buffer:
+        yield buffer
+
+@app.post("/api/chat/stream")
+async def chat_stream(req: ChatRequest, request: Request):
+    """Server-Sent Events streaming endpoint."""
+    _enforce_ip_limit(request)
+    await _require_corpus()
+    message = req.message.strip()
+    if not message:
+        raise HTTPException(422, "message must not be empty")
+    
+    snap = service.sessions.snapshot(req.session_id)
+    profile = service.merge_profile(snap.profile, req.profile)
+    
+    async def event_generator():
+        try:
+            # Stage 1: token stream from LLM
+            async for token_chunk in _answer_streaming(message, snap.history, profile):
+                yield f"data: {json.dumps({'type': 'token', 'content': token_chunk})}\n\n"
+            
+            # Stage 2: final metadata
+            yield f"data: {json.dumps({'type': 'done', 'session_id': snap.session_id})}\n\n"
+        except asyncio.TimeoutError:
+            yield f"data: {json.dumps({'type': 'error', 'content': 'timeout'})}\n\n"
+        except Exception as e:
+            yield f"data: {json.dumps({'type': 'error', 'content': str(e)})}\n\n"
+    
+    return StreamingResponse(
+        event_generator(),
+        media_type="text/event-stream",
+        headers={"Cache-Control": "no-cache", "X-Accel-Buffering": "no"}
+    )
 
 
 @app.get("/")

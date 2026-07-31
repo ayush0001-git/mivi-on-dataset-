@@ -42,6 +42,12 @@ def _loads(v, fallback):
 
 _TAG_RE = re.compile(r"<[^>]+>")
 _WS_RE = re.compile(r"\s+")
+_INJECTION_RE = re.compile(
+    r"\b(ignore\s+(?:all\s+)?(?:previous\s+)?(?:instructions|prompts|directions)|"
+    r"system\s+(?:prompt|message|instruction)|"
+    r"you\s+(?:are\s+now|must\s+now)|"
+    r"disregard\s+(?:previous|all)|"
+    r"bypass\s+(?:filter|security|rules))\b", re.I)
 
 
 # Mojibake from the source: UTF-8 bytes that were decoded as CP1252 somewhere
@@ -70,7 +76,9 @@ def clean_prose(text: str | None) -> str:
     for bad, good in _MOJIBAKE:
         if bad in text:
             text = text.replace(bad, good)
-    return _WS_RE.sub(" ", text).strip()
+    text = _WS_RE.sub(" ", text).strip()
+    # Web content injection filtering: remove prompt injections from scraped data
+    return _INJECTION_RE.sub("[FILTERED]", text)
 
 
 def _rupees(n) -> str:

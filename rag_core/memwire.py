@@ -215,10 +215,17 @@ _UNITS = {
 # different act: house rule 3 says money is copied with its stated unit and
 # never annualised, and a total-course budget cannot be hard-filtered at all
 # because course lengths vary. So an ambiguous unit means no seeded filter.
+#
+# Proximity matters: a bare \bcourse\b refused "I want a course under 1 lakh"
+# (no total-course claim there) while still passing through "total course fee"
+# correctly. The 2nd & 3rd alternatives cover the reversed phrasing ("course
+# total" / "course fee") and the Hindi variants.
 _UNSAFE_UNIT_RE = re.compile(
-    r"semester|\bsem\b|month|monthly|mahina|mahine|"
-    r"total|whole|entire|full course|\bcourse\b|"
-    r"\bper\s+(?:sem|semester|month)\b|pura|poora|puri", re.I)
+    r"\bsemester\b|\bsem\b|\bmonth(ly)?\b|\bmahina\b|\bmahine\b"
+    r"|\b(?:total|whole|entire|full|poora|pura|puri)\s+(?:course|program|degree)\b"
+    r"|\bcourse\s+(?:total|fee|cost|ka)\b"
+    r"|\bprogram\s+(?:total|fee|cost)\b"
+    r"|\bper\s+(?:sem|semester|month)\b", re.I)
 
 _RANGE_RE = re.compile(r"\s(?:to|se)\s|-|–|—")
 _AMOUNT_RE = re.compile(

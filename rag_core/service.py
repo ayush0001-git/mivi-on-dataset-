@@ -380,6 +380,9 @@ def project_answer(result: dict[str, Any]) -> dict[str, Any]:
     return {k: result[k] for k in ANSWER_CONTRACT_KEYS if k in result}
 
 
+from .semantic_cache import SemanticCache
+semantic_cache = SemanticCache()
+
 class AnswerCache:
     """LRU + TTL cache of grounded answers.
 
@@ -576,6 +579,34 @@ session_limiter = RateLimiter(RATE_SESSION_PER_MIN, RATE_SESSION_BURST)
 answer_cache = AnswerCache(CACHE_TTL_S, CACHE_MAX_ENTRIES)
 health_snapshot = TTLSnapshot(HEALTH_TTL_S)
 metrics = Metrics()
+
+
+class FeedbackStore:
+    def __init__(self, filename: str = "feedback.jsonl"):
+        from pathlib import Path
+        from . import config
+        self._lock = threading.Lock()
+        self.filename = config.ROOT / "data" / filename
+        self.filename.parent.mkdir(parents=True, exist_ok=True)
+
+    def append(self, session_id: str, rating: int, question: str = "", answer: str = "", comment: str = ""):
+        with self._lock:
+            try:
+                with open(self.filename, "a", encoding="utf-8") as f:
+                    record = {
+                        "timestamp": time.time(),
+                        "session_id": session_id,
+                        "rating": rating,
+                        "question": question,
+                        "answer": answer,
+                        "comment": comment
+                    }
+                    f.write(json.dumps(record, ensure_ascii=False) + "\n")
+            except Exception as e:
+                import sys
+                print(f"[feedback] failed to write: {e}", file=sys.stderr)
+
+feedback_store = FeedbackStore()
 
 
 def config_snapshot() -> dict[str, Any]:

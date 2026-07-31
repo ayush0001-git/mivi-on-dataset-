@@ -527,7 +527,7 @@ def _get_index() -> dict:
             ) or 0
             if known == 0:
                 raise RuntimeError(
-                    f"index at odds with {DB_FILE}: none of its first {len(sample)} "
+                    f"index at odds with the store: none of its first {len(sample)} "
                     f"ids exist in `colleges`. Rebuild the index against this store."
                 )
             if known < len(sample) * 0.8:
@@ -590,6 +590,32 @@ _STOP = {
 }
 _TOKEN_RE = re.compile(r"[0-9A-Za-zऀ-ॿ]+")
 
+_ABBREVIATIONS = {
+    "iit": ["indian institute of technology"],
+    "nit": ["national institute of technology"],
+    "iiit": ["indian institute of information technology", "international institute of information technology"],
+    "aiims": ["all india institute of medical sciences"],
+    "cs": ["computer science"],
+    "cse": ["computer science", "engineering"],
+    "it": ["information technology"],
+    "ece": ["electronics and communication"],
+    "mech": ["mechanical engineering"],
+    "civil": ["civil engineering"],
+    "btech": ["bachelor of technology", "b tech"],
+    "mtech": ["master of technology", "m tech"],
+    "bba": ["bachelor of business administration"],
+    "mba": ["master of business administration"],
+    "mbbs": ["bachelor of medicine", "bachelor of surgery"],
+    "bds": ["dental surgery"],
+    "bpharma": ["bachelor of pharmacy", "b pharm"],
+    "bcom": ["bachelor of commerce", "b com"],
+    "bsc": ["bachelor of science", "b sc"],
+    "msc": ["master of science", "m sc"],
+    "ba": ["bachelor of arts"],
+    "ma": ["master of arts"],
+    "phd": ["doctor of philosophy", "doctorate", "research"],
+}
+
 
 def _fts_query(question: str, terms: list[str] | None = None) -> str | None:
     """Build a *safe* FTS5 MATCH expression.
@@ -605,15 +631,26 @@ def _fts_query(question: str, terms: list[str] | None = None) -> str | None:
     nothing at all; BM25 is what separates the good hits, not the connective.
     """
     seen: list[str] = []
+    expanded_phrases: list[str] = []
     for raw in _TOKEN_RE.findall(str(question or "")):
         t = raw.lower()
         if len(t) < 2 or t in _STOP or t in seen:
             continue
         seen.append(t)
+        if t in _ABBREVIATIONS:
+            for phrase in _ABBREVIATIONS[t]:
+                if phrase not in expanded_phrases:
+                    expanded_phrases.append(phrase)
+                for w in phrase.split():
+                    if w not in _STOP and w not in seen:
+                        seen.append(w)
         if len(seen) >= 24:   # long pasted questions must not turn into a scan
             break
 
     parts = [f'"{t}"' for t in seen]
+    for p in expanded_phrases:
+        parts.append(f'"{p}"')
+        
     for t in terms or []:
         # Multi-word course terms ("computer science") are worth a phrase match.
         toks = [x.lower() for x in _TOKEN_RE.findall(str(t))]
@@ -959,7 +996,30 @@ def _hydrate(ids: list[str], scores: dict[str, float]) -> list[dict]:
     return hits
 
 
-def search(question: str, filters: dict | None = None, top_k: int = 12, query_vec=None) -> list[dict]:
+
+def encode_hypothetical(question: str):
+    """Generate a fake answer, embed it, use for retrieval."""
+    from .llm import chat
+    from . import config
+    
+    try:
+        prompt = f"""Write a short, factual answer to this college admissions question
+(2-3 sentences, no preamble, no formatting, just the answer text):
+{question}"""
+        fake_answer = chat(
+            [{"role": "user", "content": prompt}],
+            model=config.FAST_MODEL,
+            temperature=0.0,
+            max_tokens=200
+        )
+        if not fake_answer:
+            return None
+        return encode_query(fake_answer)  # use query prefix on the answer
+    except Exception:
+        return None
+
+
+def search(question: str, filters: dict | None = None, top_k: int = 12, query_vec=None, use_hyde: bool = False) -> list[dict]:
     """Hybrid retrieval. Returns at most `top_k` hit dicts, best first.
 
     `query_vec`: a precomputed embedding from encode_query(), so the caller can
@@ -1006,9 +1066,28 @@ def search(question: str, filters: dict | None = None, top_k: int = 12, query_ve
     fused = _rrf(dense_ids, lex_ids)
     if fused:
         dense_rank = {cid: i for i, cid in enumerate(dense_ids)}
+        
+        # Source trust scoring: Catalogue (verified) > .gov.in > random web
+        qs = ",".join("?" * len(fused))
+        trust = {r["college_id"]: r for r in be.q(
+            f"SELECT college_id, is_verified, website_url FROM colleges WHERE college_id IN ({qs})",
+            list(fused.keys())
+        )}
+        for cid, row in trust.items():
+            url = str(row["website_url"] or "").lower()
+            if row.get("is_verified"):
+                fused[cid] *= 1.5
+            elif url.endswith(".gov.in") or url.endswith(".nic.in"):
+                fused[cid] *= 1.3
+            elif url.endswith(".ac.in") or url.endswith(".edu.in"):
+                fused[cid] *= 1.1
+                
         # Ties are common at small pool sizes; break them on dense order and
         # then on id so the same query always returns the same list.
-        ordered = sorted(fused, key=lambda c: (-fused[c], dense_rank.get(c, 10**6), c))[:top_k]
+        # RRF confidence gate: a score < 0.01 means it ranked worse than 40th 
+        # in a single ranker and was absent from the other. Drop it.
+        ordered = [c for c in sorted(fused, key=lambda c: (-fused[c], dense_rank.get(c, 10**6), c))
+                   if fused[c] >= 0.01][:top_k]
     else:
         # Filter-only questions ("government colleges in Goa with a hostel")
         # carry no rankable text. Falling back to breadth of offering is a
@@ -1017,11 +1096,15 @@ def search(question: str, filters: dict | None = None, top_k: int = 12, query_ve
         # host parameters at ~32k and an unfiltered candidate set exceeds it.
         ordered = [r["college_id"] for r in be.q(
             f"SELECT c.college_id {_FROM} WHERE {where} "
-            f"ORDER BY COALESCE(a.n_courses, 0) DESC, c.name ASC LIMIT ?",
-            [*params, top_k],
+            "ORDER BY a.n_courses DESC NULLS LAST, c.college_id LIMIT ?",
+            [*params, top_k]
         )]
+        fused = {}  # No text search, no RRF score
 
-    return _hydrate(ordered, fused)
+    out = _hydrate(ordered, fused)
+    for row in out:
+        row["rrf_score"] = fused.get(row["college_id"], 0.0)
+    return out
 
 
 def to_context(hits: list[dict], max_chars: int = MAX_CONTEXT_CHARS) -> str:

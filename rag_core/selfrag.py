@@ -100,7 +100,7 @@ colleges matched.
 
 Return ONLY JSON:
 {
-  "diagnosis": "over_filtered" | "wrong_spelling" | "genuinely_absent" | "not_a_search",
+  "diagnosis": "over_filtered" | "wrong_spelling" | "genuinely_absent" | "not_a_search" | "fallback_web" | "fallback_deep_research",
   "drop_filters": [<filter names that the student never actually stated>],
   "fix_city": <corrected city/state spelling as the CORPUS would store it, or null>,
   "relax_budget_to": <int rupees per year, or null>,
@@ -120,6 +120,8 @@ Rules:
   choose it rather than inventing a relaxation that would answer a DIFFERENT
   question than the student asked.
 - "not_a_search": the message was not a college search at all.
+- "fallback_web": use this if the question requires real-time facts, current events, or news that a static database cannot answer.
+- "fallback_deep_research": use this if the question is highly complex, comparative ("which is better X or Y"), or requires synthesizing data from multiple external sources.
 - NEVER relax a budget by more than ~25%, and only when the student's wording
   was approximate ("around", "about", "under ~2 lakh"). A hard budget is a hard
   constraint: showing a student colleges they cannot afford is worse than
@@ -174,6 +176,8 @@ def apply_repair(filters: dict, verdict: dict) -> tuple[dict, str] | None:
     diagnosis = str(verdict.get("diagnosis") or "")
     if diagnosis in ("genuinely_absent", "not_a_search"):
         return None
+    if diagnosis in ("fallback_web", "fallback_deep_research"):
+        return filters, diagnosis
 
     new = dict(filters or {})
     notes: list[str] = []

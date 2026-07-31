@@ -97,6 +97,86 @@
 </footer>
 
 <script>
+
+// i18n strings
+const I18N = {
+  en: {
+    title: "mimi.ai (beta)",
+    subtitle: "MakeMyEducation's AI college counsellor",
+    placeholder: "Ask in English, हिन्दी or Hinglish — e.g. Which MBA colleges in Pune are under ₹2 lakh a year?",
+    send: "Send",
+    webOff: "🌐 Web: off",
+    webOn: "🌐 Web: on",
+    clearChat: "↻ Start over",
+    example1: "Which colleges in Dehradun offer MBA under ₹2 lakh a year?",
+    example2: "Cheapest BTech colleges in Punjab",
+    example3: "Government colleges in Kerala offering GNM nursing",
+    example4: "जयपुर में BCA कॉलेज कौन से हैं?",
+    typing: "Reading your question...",
+    stages: ["Reading your question...", "Looking through the colleges...",
+             "Checking every number...", "Writing your answer..."],
+    copyTip: "Copy answer",
+    rateLimited: "Too many questions just now — give it a few seconds.",
+    corpusLoading: "The college data is still loading on the server. Try again in a moment.",
+    serverUnreachable: "Could not reach the server. Start it with:\n  uvicorn app:app --port 8000\nthen open http://localhost:8000 in your browser.",
+    footerHint: "Every answer is grounded in MakeMyEducation's live catalogue — 38,700 colleges and 211,071 course offerings — and every cited college links back to its page on makemyeducation.com.",
+  },
+  hi: {
+    title: "mimi.ai (बीटा)",
+    subtitle: "MakeMyEducation का AI कॉलेज काउंसलर",
+    placeholder: "पूछें हिंदी या English में — जैसे, पुणे में 2 लाख के अंदर MBA कॉलेज कौन से हैं?",
+    send: "भेजें",
+    webOff: "🌐 वेब: बंद",
+    webOn: "🌐 वेब: चालू",
+    clearChat: "↻ नई शुरुआत",
+    example1: "देहरादून में 2 लाख सालाना के अंदर MBA कॉलेज कौन से हैं?",
+    example2: "पंजाब के सबसे सस्ते BTech कॉलेज",
+    example3: "केरल में GNM नर्सिंग के सरकारी कॉलेज",
+    example4: "जयपुर में BCA कॉलेज कौन से हैं?",
+    typing: "आपका सवाल पढ़ रहे हैं...",
+    stages: ["आपका सवाल पढ़ रहे हैं...", "कॉलेज देख रहे हैं...",
+             "हर नंबर जाँच रहे हैं...", "जवाब लिख रहे हैं..."],
+    copyTip: "जवाब कॉपी करें",
+    rateLimited: "अभी बहुत सारे सवाल आ रहे हैं — कुछ देर बाद पूछें।",
+    corpusLoading: "सर्वर पर कॉलेज डेटा अभी लोड हो रहा है। थोड़ी देर बाद कोशिश करें।",
+    serverUnreachable: "सर्वर से संपर्क नहीं हो पा रहा। शुरू करने के लिए:\n  uvicorn app:app --port 8000\nऔर फिर http://localhost:8000 खोलें।",
+    footerHint: "हर जवाब MakeMyEducation के लाइव कैटलॉग पर आधारित है — 38,700 कॉलेज और 211,071 कोर्स — हर कॉलेज लिंक वापस उसके पेज पर जाता है।",
+  }
+};
+
+let currentLang = localStorage.getItem("mimi_lang") || "en";
+
+function t(key) { return I18N[currentLang][key] || I18N.en[key] || key; }
+
+function applyI18n() {
+  const elTitle = document.getElementById("title");
+  if(elTitle) elTitle.textContent = t("title");
+  const elSubtitle = document.getElementById("subtitle");
+  if(elSubtitle) elSubtitle.textContent = t("subtitle");
+  const elQ = document.getElementById("q");
+  if(elQ) elQ.placeholder = t("placeholder");
+  const elSend = document.getElementById("send");
+  if(elSend) elSend.textContent = t("send");
+}
+
+document.addEventListener('DOMContentLoaded', () => {
+    const toggleBtn = document.createElement('button');
+    toggleBtn.id = 'lang-toggle';
+    toggleBtn.textContent = 'En/Hi';
+    toggleBtn.style.position = 'absolute';
+    toggleBtn.style.top = '10px';
+    toggleBtn.style.right = '10px';
+    document.body.appendChild(toggleBtn);
+    
+    toggleBtn.addEventListener("click", () => {
+      currentLang = currentLang === "en" ? "hi" : "en";
+      localStorage.setItem("mimi_lang", currentLang);
+      applyI18n();
+    });
+    
+    applyI18n();
+});
+
 const chat = document.getElementById("chat");
 const q = document.getElementById("q");
 const send = document.getElementById("send");
@@ -187,6 +267,72 @@ function addBot(result, isWeb, question){
   meta.appendChild(copy);
   chat.appendChild(meta);
   scroll();
+}
+
+
+async function askStream(question) {
+  const t = el("div", "typing", "Reading your question...");
+  chat.appendChild(t); scroll();
+  
+  const m = el("div", "msg bot");
+  chat.appendChild(m);
+  
+  try {
+      const response = await fetch("/api/chat/stream", {
+          method: "POST",
+          headers: {"Content-Type": "application/json"},
+          body: JSON.stringify({
+              message: question,
+              session_id: sessionId,
+              history: chatHistory.slice(-6),
+              profile: studentProfile
+          })
+      });
+      
+      if (response.status === 429) {
+          throw new Error("Too many questions just now — give it a few seconds.");
+      }
+      if (response.status === 503) {
+          throw new Error("The college data is still loading on the server. Try again in a moment.");
+      }
+      
+      const reader = response.body.getReader();
+      const decoder = new TextDecoder();
+      let buffer = "";
+      let finalText = "";
+      
+      while (true) {
+          const {done, value} = await reader.read();
+          if (done) break;
+          buffer += decoder.decode(value, {stream: true});
+          const lines = buffer.split("\n");
+          buffer = lines.pop(); // keep incomplete line in buffer
+          
+          for (const line of lines) {
+              if (line.startsWith("data: ")) {
+                  try {
+                      const data = JSON.parse(line.slice(6));
+                      if (data.type === "token") {
+                          finalText += data.content;
+                          m.textContent = finalText;  // simple text update
+                          scroll();
+                      } else if (data.type === "done") {
+                          if (data.session_id) sessionId = data.session_id;
+                      } else if (data.type === "error") {
+                          m.textContent = "Error: " + data.content;
+                      }
+                  } catch(e) {}
+              }
+          }
+      }
+      
+      t.remove();
+      chatHistory.push({role: "user", content: question},
+                       {role: "assistant", content: finalText});
+  } catch (err) {
+      t.remove();
+      m.textContent = "Error: " + err.message;
+  }
 }
 
 async function ask(question, mode, prefs){
@@ -293,7 +439,7 @@ async function submit(){
     };
     await ask(text, "web", prefs);
   } else {
-    await ask(text, "db");
+    await askStream(text);
   }
   send.disabled = false; q.focus();
 }

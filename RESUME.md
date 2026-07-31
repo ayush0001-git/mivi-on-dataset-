@@ -22,6 +22,7 @@ idle on network waits by design.
 All three were started detached and survive a closed terminal. Check them with
 `python status.py`; restart any that died.
 
+
 | job | command | note |
 |---|---|---|
 | dense index | `python -m rag_core.index_build` | ~24,600 cards to embed, ~6-14/s. Cards were re-rendered after the fee fix, so the old vectors are stale. |

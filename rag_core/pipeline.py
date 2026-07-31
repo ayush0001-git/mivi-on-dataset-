@@ -148,8 +148,9 @@ salary figures.
 
 Classify the user's message and extract hard filters. Return ONLY JSON:
 {
-  "route": "data_query" | "smalltalk" | "out_of_scope",
+  "route": "data_query" | "smalltalk" | "out_of_scope" | "deep_research",
   "question_kind": "enumerate" | "recommend" | "lookup" | "profile_share" | "other",
+  "complexity": <integer 1 to 10 based on query difficulty, 1=simple fact lookup, 5=medium search/compare, 10=broad analytical research>,
   "language": "<language of the message, e.g. English, Hindi, Hinglish>",
   "filters": {
     "state": <Indian state as written in full, e.g. "Uttarakhand", or null>,
@@ -182,6 +183,7 @@ Rules:
   A student sharing their marks/percentage/budget (e.g. "I got 55% in class",
   "mera budget 1 lakh hai") is NEVER smalltalk — it is route "data_query"
   with question_kind "profile_share".
+- "deep_research": questions that require deep analytical comparison, heavy reasoning across multiple criteria, or asking for latest/current trends that require web access.
 - "smalltalk": greetings, thanks, who-are-you.
 - "out_of_scope": unrelated to colleges/admissions (poems, politics, coding...).
 - question_kind: "enumerate" = user wants the colleges matching criteria
@@ -439,6 +441,8 @@ an empty citations list: asking the opening question IS engaging with the
 student, not refusing them, and `answered=false` is reserved for "I looked and
 the record does not support an answer".
 
+16. SOURCE FRESHNESS AND YEAR REQUESTS. If the student asks for "latest", "current", or specific year figures (e.g. "2025 cutoff", "current fees"), you MUST state the year the data in CONTEXT is actually from (e.g., "In 2024, the fees were..."). Do NOT pretend undated or older figures are current just to satisfy the user's phrasing. If the card explicitly says a fact is undated or from an older year, warn the student that it may not reflect the current year.
+
 Citations discipline: cite ONLY the colleges that form part of your actual
 answer. For budget/eligibility questions, cite only colleges that satisfy the
 stated constraints — never cite a college that fails them (you may say that
@@ -600,29 +604,43 @@ def _fold_devanagari(question: str) -> str:
 
 
 def _load_gazetteer() -> dict:
+    """Load distinct states/cities + curated aliases, cached per process.
+
+    Retry-on-error: a transient DB failure must not pin the gazetteer to an
+    empty dict for the lifetime of the process. The cached sentinel is None
+    until a successful load, so the next call after a recovery re-reads.
+    """
     global _gazetteer
-    if _gazetteer is None:
-        with _gazetteer_lock:
-            if _gazetteer is None:
-                g = {"states": {}, "cities": {}, "alias": {}}
-                try:
-                    from .store.backend import get_backend
-                    be = get_backend()
-                    for r in be.q("SELECT DISTINCT state FROM colleges "
-                                  "WHERE state IS NOT NULL AND state <> ''"):
-                        g["states"][r["state"].strip().lower()] = r["state"].strip()
-                    # Cities shorter than 4 chars (Ara, Goa-as-city) collide with
-                    # ordinary words; the state pass already covers Goa.
-                    for r in be.q("SELECT DISTINCT city FROM colleges "
-                                  "WHERE city IS NOT NULL AND LENGTH(city) >= 4"):
-                        g["cities"][r["city"].strip().lower()] = r["city"].strip()
-                    for r in be.q("SELECT alias, canonical FROM place_alias"):
-                        g["alias"][r["alias"].strip().lower()] = r["canonical"].strip()
-                except Exception as exc:  # noqa: BLE001 - fallback must not die
-                    print(f"[route] gazetteer unavailable ({str(exc)[:60]}); "
-                          f"heuristic route will not extract places", file=sys.stderr)
-                _gazetteer = g
-    return _gazetteer
+    if _gazetteer is not None:
+        return _gazetteer
+    with _gazetteer_lock:
+        if _gazetteer is not None:
+            return _gazetteer
+        g = {"states": {}, "cities": {}, "alias": {}}
+        try:
+            from .store.backend import get_backend
+            be = get_backend()
+            for r in be.q("SELECT DISTINCT state FROM colleges "
+                          "WHERE state IS NOT NULL AND state <> ''"):
+                g["states"][r["state"].strip().lower()] = r["state"].strip()
+            # Cities shorter than 4 chars (Ara, Goa-as-city) collide with
+            # ordinary words; the state pass already covers Goa.
+            for r in be.q("SELECT DISTINCT city FROM colleges "
+                          "WHERE city IS NOT NULL AND LENGTH(city) >= 4"):
+                g["cities"][r["city"].strip().lower()] = r["city"].strip()
+            for r in be.q("SELECT alias, canonical FROM place_alias"):
+                g["alias"][r["alias"].strip().lower()] = r["canonical"].strip()
+            # Only cache the gazetteer when the load actually succeeded;
+            # an empty dict (DB down at startup) must NOT pin a permanent
+            # no-places extraction, so the next call retries.
+            _gazetteer = g
+        except Exception as exc:  # noqa: BLE001 - fallback must not die
+            print(f"[route] gazetteer unavailable ({str(exc)[:60]}); "
+                  f"heuristic route will not extract places until the store recovers",
+                  file=sys.stderr)
+            # Leave _gazetteer as None so the next call retries.
+    return _gazetteer if _gazetteer is not None else {
+        "states": {}, "cities": {}, "alias": {}}
 
 
 def _heuristic_route(question):
@@ -1294,6 +1312,12 @@ _YEAR_RE = re.compile(r"(?:established|founded|est\.)\s*(?:in)?\s*(\d{4})", re.I
 _NCOURSES_RE = re.compile(
     r"(\d[\d,]{0,7})\s+(?:different\s+)?(?:courses|programmes|programs)\b", re.I)
 
+# Added verifiers for common hallucination types
+_PCT_RE = re.compile(r"(\d+(?:\.\d+)?)\s*%", re.I)
+_URL_RE = re.compile(r"https?://[^\s)\]]+|www\.[^\s)\]]+", re.I)
+# Dates like "15th August 2024", "12 Jan 2024", "2024-05-12"
+_DATE_RE = re.compile(r"\b(\d{1,2}(?:st|nd|rd|th)?\s+(?:Jan|Feb|Mar|Apr|May|Jun|Jul|Aug|Sep|Oct|Nov|Dec)[a-z]*\s+\d{4}|\d{4}-\d{2}-\d{2})\b", re.I)
+
 
 def _ints(text):
     """Every integer written in a piece of grounded text, comma-insensitive.
@@ -1380,6 +1404,10 @@ def _numeric_violations(result, hits_by_id, extra_ok=None):
 
     allowed = set(extra_ok or ())
     fees, years, counts = set(), set(), set()
+    allowed_pcts: set[str] = set()
+    allowed_urls: set[str] = set()
+    allowed_dates: set[str] = set()
+    
     for h in cited:
         allowed |= _ints(h.get("card", ""))
         for key in ("min_tuition_inr", "max_tuition_inr"):
@@ -1391,31 +1419,79 @@ def _numeric_violations(result, hits_by_id, extra_ok=None):
         m = re.search(r"^Established:\s*(\d{4})", h.get("card", ""), re.M)
         if m:  # establish_year is not in the retrieval hit; the card is
             years.add(int(m.group(1)))
+            
+        card_text = h.get("card", "")
+        for m_pct in _PCT_RE.finditer(card_text):
+            allowed_pcts.add(m_pct.group(1))
+        for m_url in _URL_RE.finditer(card_text):
+            allowed_urls.add(m_url.group(0).lower().rstrip(".,;!"))
+        for m_date in _DATE_RE.finditer(card_text):
+            allowed_dates.add(m_date.group(1).lower())
+            
     # per-semester / per-year restatements of a real tuition figure are honest
-    allowed |= fees | {f * 2 for f in fees} | {f // 2 for f in fees} | counts | years
+    official_fees = fees | {f * 2 for f in fees} | {f // 2 for f in fees}
+    allowed |= official_fees | counts | years
 
     problems = []
     for m in _MONEY_RE.finditer(answer):
         # group 1 = currency-prefixed figure, group 2 = the bare upper bound of
         # a range ("Rs 45,000-1,80,000"). Exactly one of them matches.
         val = int((m.group(1) or m.group(2)).replace(",", ""))
-        if val not in allowed:
+        
+        # Contradiction detection: fees must match official catalogue fees,
+        # not just any number in the web text.
+        if official_fees and val not in official_fees and val not in (extra_ok or ()):
+            problems.append(
+                f"answer states Rs {val:,}, which contradicts the official tuition "
+                f"figures of the cited colleges ({sorted(official_fees)}) — use the official figures.")
+        elif not official_fees and val not in allowed:
             problems.append(
                 f"answer states Rs {val:,}, which appears nowhere in the cited "
-                f"colleges' listings (their tuition figures: "
-                f"{sorted(fees) or 'none recorded'}) — correct it or drop it")
+                f"colleges' listings (their tuition figures: none recorded) — correct it or drop it")
     for m in _YEAR_RE.finditer(answer):
         val = int(m.group(1))
-        if val not in allowed:
+        # Contradiction detection: year must match official established year
+        if years and val not in years:
+            problems.append(
+                f"answer says established {val}, which contradicts the cited college's "
+                f"official established year ({sorted(years)}) — use the official year.")
+        elif not years and val not in allowed:
             problems.append(
                 f"answer says established {val}, which matches no cited college "
-                f"(real: {sorted(years) or 'none recorded'}) — correct it or drop it")
+                f"(real: none recorded) — correct it or drop it")
+                
     for m in _NCOURSES_RE.finditer(answer):
         val = int(m.group(1).replace(",", ""))
-        if val not in allowed:
+        if counts and val not in counts:
+            problems.append(
+                f"answer states {val} courses, which contradicts the official course counts "
+                f"({sorted(counts)}) — use the official counts.")
+        elif not counts and val not in allowed:
             problems.append(
                 f"answer states {val} courses, which matches no cited college "
-                f"(real: {sorted(counts) or 'none recorded'}) — correct it or drop it")
+                f"(real: none recorded) — correct it or drop it")
+                
+    for m in _PCT_RE.finditer(answer):
+        val = m.group(1)
+        if val not in allowed_pcts:
+            problems.append(
+                f"answer states {val}%, which is not in the cited cards. Do not hallucinate "
+                f"placement rates or pass percentages.")
+                
+    for m in _URL_RE.finditer(answer):
+        val = m.group(0).lower().rstrip(".,;!")
+        if val not in allowed_urls and "makemyeducation.com" not in val:
+            problems.append(
+                f"answer includes URL '{val}' which is not in the cited cards. "
+                f"Do not invent external links.")
+                
+    for m in _DATE_RE.finditer(answer):
+        val = m.group(1).lower()
+        if val not in allowed_dates:
+            problems.append(
+                f"answer includes specific date '{m.group(1)}' which is not in the cited cards. "
+                f"Do not invent precise dates.")
+                
     return problems
 
 
@@ -1614,7 +1690,7 @@ def _cache_load():
 _cache_load()
 
 
-def _to_context(hits):
+def _to_context(hits, max_context_chars=None):
     """CONTEXT is exactly the cards retrieval returned — render_card is the
     single definition of what the model may see about a college, and the
     verifier checks the answer's numbers against these same strings.
@@ -1624,12 +1700,22 @@ def _to_context(hits):
     drops whole lowest-ranked cards rather than truncating one mid-sentence —
     a half-card would let the model read a fee that belongs to another college.
     """
-    budget = getattr(config, "MAX_CONTEXT_CHARS", 12_000)
+    budget = max_context_chars if max_context_chars else getattr(config, "MAX_CONTEXT_CHARS", 12_000)
     out, used = [], 0
+    seen_hashes = set()
     for h in hits:
         card = h.get("card")
         if not card:
             continue
+            
+        # Deduplicate: strip the Mongo ObjectId so identical records with different IDs are caught
+        content_for_hash = re.sub(r"\(id [a-f0-9]{24}\)", "", card)
+        hsh = hash(content_for_hash)
+        if hsh in seen_hashes:
+            print(f"[pipeline] context dedup: dropped {h.get('college_id')} as exact duplicate", file=sys.stderr)
+            continue
+        seen_hashes.add(hsh)
+
         if out and used + len(card) + 2 > budget:
             break
         out.append(card)
@@ -1637,10 +1723,18 @@ def _to_context(hits):
     return "\n\n".join(out)
 
 
-def _search(question, filters, top_k, query_vec=None):
+
+def _search(question, filters, top_k, query_vec=None, complexity_score=5, profile=None):
     """retrieve.search with the store's failure surfaced, not swallowed."""
-    return retrieve.search(question, filters=filters or None, top_k=top_k,
+    hits = retrieve.search(question, filters=filters or None, top_k=top_k,
                            query_vec=query_vec)
+    from . import config
+    from . import rerank
+    if hits and config.RERANK_ENABLED:
+        hits = rerank.rerank(question, hits, top_k=top_k, 
+                             complexity_score=complexity_score, 
+                             profile=profile)
+    return hits
 
 
 def _count(filters):
@@ -1663,7 +1757,7 @@ def _superlatives(filters, limit=5):
         return {}
 
 
-def answer_question(question, history=None, known_profile=None):
+def _prepare_generation(question, history=None, known_profile=None, session_id=None):
     """Full pipeline. Returns the output dict for answer.py to print.
 
     `history` (optional): recent [{role, content}, ...] turns from the demo
@@ -1677,6 +1771,18 @@ def answer_question(question, history=None, known_profile=None):
     long conversation without this; the client re-sends the running profile
     every turn so it survives regardless of how long the chat gets."""
     t_start = time.perf_counter()
+    
+    # Auto-load persistent profile if the client didn't send one
+    if not known_profile and session_id:
+        try:
+            from .memory import load
+            loaded = load(session_id)
+            known_profile = loaded.get("profile", {})
+            if not history and loaded.get("history"):
+                history = loaded.get("history")
+        except Exception as e:
+            print(f"[pipeline] failed to auto-load profile: {e}", file=sys.stderr)
+
     # Cache key: lowercase + whitespace-collapse ONLY. Do not be tempted to
     # use _norm() here — it strips non-Latin characters, which would collapse
     # every Hindi/Tamil question onto a single cache entry (a real bug we hit).
@@ -1684,13 +1790,11 @@ def answer_question(question, history=None, known_profile=None):
     if config.CACHE_ENABLED and not history and cache_key in _CACHE:
         print("[cache] hit", file=sys.stderr)
         result = dict(_CACHE[cache_key])
-        # The demo client tracks a running profile; a cache hit must not make
-        # the "profile" key vanish (the client would keep its own copy, but
-        # the contract stays consistent either way).
         if history is not None or known_profile is not None:
             result["profile"] = dict(known_profile) if isinstance(known_profile, dict) else {}
-        return result
-    calls = []  # per-LLM-call token/latency records
+        return {"fast_return": result}
+    calls = []
+    latencies = {}
 
     # ---- 0. Code-level guards & fast paths (no LLM, no retrieval) ----------
     # Order matters: these run BEFORE the router so a greeting, an injection
@@ -1702,7 +1806,7 @@ def answer_question(question, history=None, known_profile=None):
                       "total_latency_s": round(time.perf_counter() - t_start, 3)})
         if history is not None or known_profile is not None:
             fast["profile"] = dict(known_profile) if isinstance(known_profile, dict) else {}
-        return fast
+        return {"fast_return": fast}
 
     # Defence-in-depth: an obvious "ignore your rules" attempt gets a calm,
     # on-brand deflection in code, before it can reach any model.
@@ -1716,7 +1820,7 @@ def answer_question(question, history=None, known_profile=None):
                   "citations": [], "answered": True, "reason_if_unanswered": None}
         if history is not None or known_profile is not None:
             result["profile"] = dict(known_profile) if isinstance(known_profile, dict) else {}
-        return result
+        return {"fast_return": result}
 
     # Safety guard: a distressed student must never get an "I only help with
     # colleges" brush-off. Caught in code so it can't depend on the router.
@@ -1734,7 +1838,7 @@ def answer_question(question, history=None, known_profile=None):
                   "reason_if_unanswered": None}
         if history is not None or known_profile is not None:
             result["profile"] = dict(known_profile) if isinstance(known_profile, dict) else {}
-        return result
+        return {"fast_return": result}
 
     hist_text = ""
     if history:
@@ -1752,6 +1856,7 @@ def answer_question(question, history=None, known_profile=None):
     prefetch = _EmbedPrefetch(question)
 
     # ---- 1. Route + extract filters (small, cheap model) -------------------
+    t_route_start = time.perf_counter()
     try:
         raw = chat(
             [{"role": "system", "content": ROUTER_SYSTEM},
@@ -1765,6 +1870,7 @@ def answer_question(question, history=None, known_profile=None):
     except Exception as e:  # router must never kill the pipeline
         print(f"[router fallback] {e}", file=sys.stderr)
         route_info = _heuristic_route(question)
+    latencies["route_s"] = round(time.perf_counter() - t_route_start, 3)
 
     # The heuristic is a FLOOR, not just a fallback.
     #
@@ -1804,6 +1910,13 @@ def answer_question(question, history=None, known_profile=None):
     for k, v in turn_profile.items():
         if v:
             merged_profile[k] = v
+            
+    try:
+        complexity_score = int(route_info.get("complexity", 5))
+    except (ValueError, TypeError):
+        complexity_score = 5
+    complexity_score = max(1, min(10, complexity_score))
+        
     unit_note = route_info.get("unit_note") if isinstance(route_info.get("unit_note"), str) else None
     # unit_note is strictly for money/unit conversions; routers occasionally
     # stuff commentary there, which must never leak into an answer.
@@ -1843,7 +1956,60 @@ def answer_question(question, history=None, known_profile=None):
         route = "data_query"
         question_kind = "profile_share"
 
+    # ---- 2a-fast. SQL-direct answers for pure counting questions -----------
+    # "How many engineering colleges in Maharashtra?" is answered by SQL's
+    # count_matching() — the LLM just restates it and sometimes hallucinates
+    # "around 1,300" when SQL already computed exactly 1,284. Skip the LLM.
+    _PURE_COUNT_RE = re.compile(
+        r"\b(?:how many|kitne|kitni|total|count|number of)\b", re.I)
+    if (_PURE_COUNT_RE.search(question) and route == "data_query"
+            and question_kind in ("enumerate", "other", None)
+            and not _asks_superlative(question)
+            and not history):  # conversational context needs the LLM
+        try:
+            count_filters = _clean_filters(filters)
+            total_count = retrieve.count_matching(count_filters or None)
+            if total_count is not None:
+                # Build a human-readable description of the filter set
+                parts = []
+                if count_filters.get("college_type"):
+                    parts.append(count_filters["college_type"].lower())
+                if count_filters.get("course_terms"):
+                    parts.append("/".join(count_filters["course_terms"]))
+                parts.append("colleges")
+                if count_filters.get("state"):
+                    parts.append(f"in {count_filters['state']}")
+                if count_filters.get("city"):
+                    parts.append(f"in {count_filters['city']}")
+                if count_filters.get("max_tuition_inr"):
+                    parts.append(f"under ₹{count_filters['max_tuition_inr']:,}")
+                if count_filters.get("hostel_required"):
+                    parts.append("with hostel")
+                desc = " ".join(parts)
+                answer_text = (f"There are {total_count:,} {desc} in our listings."
+                               if total_count > 0
+                               else f"We don't have any {desc} matching those exact filters.")
+                if total_count > 0 and total_count <= 5:
+                    answer_text += " Would you like me to list them?"
+                elif total_count > 5:
+                    answer_text += " Want me to shortlist the best options for you?"
+                result = {"answer": answer_text, "citations": [],
+                          "answered": True, "reason_if_unanswered": None}
+                _log_metrics({"question": question, "route": "sql_direct",
+                              "calls": calls, "retrieved": [],
+                              "total_matching": total_count, "verified": True,
+                              "total_latency_s": round(time.perf_counter() - t_start, 3)})
+                if history is not None or known_profile is not None:
+                    result["profile"] = merged_profile
+                return {"fast_return": result}
+        except Exception as exc:  # noqa: BLE001 - fall through to normal pipeline
+            print(f"[sql_direct] count failed, using full pipeline: {exc}",
+                  file=sys.stderr)
+
     # ---- 2a. Non-data routes skip retrieval AND the big model entirely -----
+    if route in ("web", "deep_research"):
+        return {"switch_to_mode": route}
+
     _GREETING_TONES = [
         "warm and supportive — like a friendly older mentor checking in",
         "upbeat and welcoming — genuinely happy to chat and help them out",
@@ -1879,21 +2045,35 @@ def answer_question(question, history=None, known_profile=None):
         }
         _log_metrics({"question": question, "route": route, "calls": calls,
                       "retrieved": [], "verified": True,
-                      "total_latency_s": round(time.perf_counter() - t_start, 3)})
+                      "total_latency_s": round(time.perf_counter() - t_start, 3),
+                      **latencies})
         if config.CACHE_ENABLED:
             _cache_store(cache_key, result)
         # Preserve the running profile through a smalltalk turn — a "thanks!"
         # or "hi" mid-conversation must not reset what's already been learned.
         if history is not None or known_profile is not None:
             result["profile"] = merged_profile
-        return result
+        return {"fast_return": result}
 
     # ---- 2b. Hybrid retrieval ----------------------------------------------
-    default_k = int(getattr(config, "TOP_K", 12) or 12)
-    # Aggregate questions get a wider shortlist, NOT the corpus: the count and
-    # the superlatives come from SQL below, and the extra cards only give the
-    # shown list room to be ranked and trimmed.
-    top_k = min(default_k * 2, 24) if needs_all else default_k
+    # Adaptive top-k: driven by complexity_score.
+    # Simple (1-3): top 2. Medium (4-7): top 10. Complex (8-10): top 40.
+    if complexity_score <= 3:
+        default_k = 2
+        max_context_chars = 1500
+    elif complexity_score <= 7:
+        default_k = 10
+        max_context_chars = 5000
+    else:
+        default_k = 40
+        max_context_chars = 15000
+        
+    adaptive = getattr(config, "ADAPTIVE_TOP_K", {})
+    if question_kind in adaptive:
+        default_k = adaptive[question_kind]
+        
+    # Aggregate questions get a wider shortlist for superlative injection.
+    top_k = min(default_k * 2, 40) if needs_all else default_k
 
     # A bare "2" or "compare these two" carries no retrievable signal against
     # 35k colleges — resolve the referent from the counsellor's last numbered
@@ -1912,7 +2092,10 @@ def answer_question(question, history=None, known_profile=None):
     qv = prefetch.result()  # computed concurrently with the router call above
     if search_query is not question:
         qv = None  # the prefetched vector embeds the wrong text; re-encode
-    hits = _search(search_query, filters, top_k, query_vec=qv)
+    
+    t_search_start = time.perf_counter()
+    hits = _search(search_query, filters, top_k, query_vec=qv, 
+                   complexity_score=complexity_score, profile=merged_profile)
 
     # ---- Self-RAG: repair retrieval BEFORE falling back to blunt relaxation --
     # Ordering is the point. The relaxation below rescues a dead end by DROPPING
@@ -1929,7 +2112,11 @@ def answer_question(question, history=None, known_profile=None):
             repaired = selfrag.apply_repair(filters, verdict)
             if repaired:
                 new_filters, what = repaired
-                new_hits = _search(search_query, new_filters, top_k, query_vec=qv)
+                if what in ("fallback_web", "fallback_deep_research"):
+                    return {"switch_to_mode": what.replace("fallback_", "")}
+                    
+                new_hits = _search(search_query, new_filters, top_k, query_vec=qv,
+                                   complexity_score=complexity_score, profile=merged_profile)
                 # Only adopt a repair that actually helped. A relaxation that
                 # returns the same nothing has cost latency and changed the
                 # question for no gain, so it is discarded.
@@ -1940,6 +2127,7 @@ def answer_question(question, history=None, known_profile=None):
                     repair_note = selfrag.context_note(what, verdict)
     except Exception as exc:  # noqa: BLE001 - never let the critic break an answer
         print(f"[selfrag] skipped: {exc}", file=sys.stderr)
+    latencies["search_s"] = round(time.perf_counter() - t_search_start, 3)
 
     relaxed_note = repair_note
     stated = {k: v for k, v in filters.items() if v and k != "include_abroad"}
@@ -1949,9 +2137,11 @@ def answer_question(question, history=None, known_profile=None):
         # /level the student cares about, drop the money and geography first.
         keep = {k: v for k, v in filters.items()
                 if k in ("course_terms", "program_level", "include_abroad")}
-        hits = _search(search_query, keep, top_k, query_vec=qv)
+        hits = _search(search_query, keep, top_k, query_vec=qv,
+                       complexity_score=complexity_score, profile=merged_profile)
         if not hits:
-            hits = _search(search_query, None, top_k, query_vec=qv)
+            hits = _search(search_query, None, top_k, query_vec=qv,
+                           complexity_score=complexity_score, profile=merged_profile)
         relaxed_note += (
             f"ZERO MATCHES: no college in the catalogue satisfies the stated "
             f"constraints {json.dumps(stated)}. Counsel honestly, never dead-end: "
@@ -1994,7 +2184,8 @@ def answer_question(question, history=None, known_profile=None):
             n_offering = _count(course_only)
             if n_offering:
                 hits = _search(" ".join(missing) + " " + question, course_only,
-                               top_k, query_vec=None)
+                               top_k, query_vec=None,
+                               complexity_score=complexity_score, profile=merged_profile)
                 relaxed_note += (
                     f"PROGRAM vs FILTER CONFLICT (counted in SQL): "
                     f"{n_offering:,} colleges DO offer {', '.join(missing)}, but none "
@@ -2009,7 +2200,7 @@ def answer_question(question, history=None, known_profile=None):
 
     context_ids = {h["college_id"] for h in hits}
     hits_by_id = {h["college_id"]: h for h in hits}
-    context = _to_context(hits) if hits else "(no colleges matched the hard filters)"
+    context = _to_context(hits, max_context_chars=max_context_chars) if hits else "(no colleges matched the hard filters)"
 
     # Every code-computed block is also collected here: the numeric verifier
     # must accept figures the model correctly repeats back from OUR arithmetic
@@ -2292,11 +2483,65 @@ def answer_question(question, history=None, known_profile=None):
     extra_ok = _ints("".join(code_notes))
     if raw_budget:
         extra_ok |= {raw_budget, raw_budget // 2, raw_budget * 2}
+    return {
+        "messages": messages,
+        "extra_ok": extra_ok,
+        "calls": calls,
+        "context_ids": context_ids,
+        "total": total,
+        "route": route,
+        "merged_profile": merged_profile,
+        "cache_key": cache_key,
+        "t_start": t_start,
+        "hits": hits,
+        "hits_by_id": hits_by_id,
+        "course_terms": course_terms,
+        "negated": negated,
+        "sup": sup,
+        "question_kind": question_kind,
+        "latencies": latencies,
+        "complexity_score": complexity_score,
+        "top_k_used": top_k,
+    }
+
+def answer_question(question, history=None, known_profile=None, session_id=None):
+    prep = _prepare_generation(question, history, known_profile, session_id)
+    if "fast_return" in prep:
+        return prep["fast_return"]
+    
+    messages = prep["messages"]
+    extra_ok = prep["extra_ok"]
+    calls = prep["calls"]
+    context_ids = prep["context_ids"]
+    total = prep["total"]
+    route = prep["route"]
+    merged_profile = prep["merged_profile"]
+    cache_key = prep["cache_key"]
+    t_start = prep["t_start"]
+    hits = prep["hits"]
+    hits_by_id = prep["hits_by_id"]
+    course_terms = prep["course_terms"]
+    negated = prep["negated"]
+    sup = prep["sup"]
+    question_kind = prep["question_kind"]
+    latencies = prep["latencies"]
+    
     result, verified = None, False
+    verification_attempts = 0
+    verification_reasons = []
+    latencies["gen_s"] = []
+    latencies["verify_s"] = []
+    
+    complexity_score = prep.get("complexity_score", 5)
+    gen_max_tokens = 500 if complexity_score <= 3 else (1500 if complexity_score <= 7 else 6000)
+    
     for attempt in range(3):
+
         try:
+            t0_gen = time.perf_counter()
             raw = chat(messages, model=config.GEN_MODEL, json_mode=True,
-                       temperature=0.0, max_tokens=1400, usage_log=calls)
+                       temperature=0.0, max_tokens=gen_max_tokens, usage_log=calls)
+            latencies["gen_s"].append(round(time.perf_counter() - t0_gen, 3))
             result = _parse_json(raw)
             result = {
                 # strip stray markdown bold — the JSON answer is plain text
@@ -2321,22 +2566,35 @@ def answer_question(question, history=None, known_profile=None):
                              "Your previous reply was not valid JSON. Return ONLY the JSON object."})
             continue
 
+        t0_ver = time.perf_counter()
         ok, problems = _verify(
             result, context_ids, allow_uncited=question_kind == "profile_share")
-        # Negation questions ("which colleges do NOT offer X") legitimately
-        # cite colleges that lack the program — the exact-match check must
-        # stand down there or it would flag every correct citation.
-        problems = (problems
-                    + ([] if negated else
-                       _course_violations(result, question, hits_by_id, course_terms))
-                    + _name_violations(result, hits)
-                    + _voice_violations(result)
-                    + _rank_violations(result, hits_by_id)
-                    + _superlative_violations(result, question, sup)
-                    + _numeric_violations(result, hits_by_id, extra_ok))
+        
+        # Adaptive Verification
+        if complexity_score <= 3:
+            # Fast verification for simple lookups
+            problems = (problems
+                        + ([] if negated else
+                           _course_violations(result, question, hits_by_id, course_terms))
+                        + _name_violations(result, hits)
+                        + _numeric_violations(result, hits_by_id, extra_ok))
+        else:
+            # Full advanced verification for complex/comparative queries
+            problems = (problems
+                        + ([] if negated else
+                           _course_violations(result, question, hits_by_id, course_terms))
+                        + _name_violations(result, hits)
+                        + _voice_violations(result)
+                        + _rank_violations(result, hits_by_id)
+                        + _superlative_violations(result, question, sup)
+                        + _numeric_violations(result, hits_by_id, extra_ok))
+        latencies["verify_s"].append(round(time.perf_counter() - t0_ver, 3))
         if not problems:
             verified = True
             break
+            
+        verification_attempts += 1
+        verification_reasons.extend(problems)
         print(f"[verify failed, attempt {attempt + 1}] {problems}", file=sys.stderr)
         messages.append({"role": "assistant", "content": raw})
         messages.append({"role": "user", "content":
@@ -2360,16 +2618,109 @@ def answer_question(question, history=None, known_profile=None):
     if result["answered"]:
         result["reason_if_unanswered"] = None
     result["answer"] = _format_answer(result["answer"])
+    result["retrieved_ids"] = [h.get("college_id") for h in hits if h.get("college_id")]
+
+    rrf_scores = [h.get("rrf_score", 0.0) for h in hits if h.get("rrf_score", 0.0) > 0.0]
+    mean_rrf = sum(rrf_scores) / len(rrf_scores) if rrf_scores else 0.0
+    
+    # Unified Confidence Engine
+    c_verif = 40 if (verified and verification_attempts == 0) else (20 if verified else 0)
+    c_retriev = min(30, int(mean_rrf * 30))
+    c_source = 15 if hits else 0  # Assuming 1.0 trust for internal DB
+    c_router = 10 if route == "data_query" else 5
+    c_reranker = 5
+    
+    total_confidence = c_verif + c_retriev + c_source + c_router + c_reranker
+    result["confidence_score"] = total_confidence
+    
+    if verified and result.get("answered"):
+        if total_confidence < 40:
+            result["answered"] = False
+            result["answer"] = "I'm not confident enough to answer this accurately. Could you clarify your question?"
+        elif total_confidence < 70:
+            result["answer"] += "\n\n*(Note: I'm only moderately confident about this information.)*"
 
     _log_metrics({"question": question, "route": route, "calls": calls,
                   "retrieved": sorted(context_ids), "total_matching": total,
                   "verified": verified,
+                  "verification_attempts": verification_attempts,
+                  "verification_reasons": verification_reasons,
+                  "mean_rrf": round(mean_rrf, 4),
+                  "complexity_score": prep.get("complexity_score"),
+                  "confidence_score": total_confidence,
+                  "top_k_used": prep.get("top_k_used"),
+                  "final_citations": result.get("citations", []),
+                  "latencies": latencies,
                   "total_latency_s": round(time.perf_counter() - t_start, 3)})
-    if config.CACHE_ENABLED and verified and not history:
+    if (config.CACHE_ENABLED and verified and not history
+            and route == "data_query"):
+        # Only cache genuine data queries: a "thanks!" or "hi" or out_of_scope
+        # must not be pinned for 15 minutes — a returning user asking for a
+        # poem is not a counsellor's "hi", and a mid-conversation greeting
+        # mid-conversation is the canonical smalltalk path that already
+        # returns a random opener each call. Caching it would freeze the opener.
         _cache_store(cache_key, result)
     # Only the conversational demo path gets a "profile" key — answer.py
     # never passes history/known_profile, so its stdout contract (exactly
     # answer/citations/answered/reason_if_unanswered) is untouched.
     if history is not None or known_profile is not None:
         result["profile"] = merged_profile
+        
+    if known_profile and known_profile.get("developer_mode"):
+        result["explainability"] = {
+            "router_intent": prep.get("question_kind"),
+            "complexity_score": prep.get("complexity_score"),
+            "top_k_used": prep.get("top_k_used"),
+            "confidence_breakdown": {
+                "total": total_confidence,
+                "verification": c_verif,
+                "retrieval": c_retriev,
+                "source_trust": c_source,
+                "router": c_router,
+                "reranker": c_reranker
+            },
+            "latencies": latencies
+        }
+        
+    # Async Reasoning Validator (Non-blocking)
+    if verified and result.get("answered") and complexity_score >= 4:
+        threading.Thread(target=_async_validate_reasoning,
+                         args=(question, result["answer"], messages[1]["content"]),
+                         daemon=True).start()
+                         
     return result
+
+def _async_validate_reasoning(question: str, answer: str, context: str):
+    """Background task to evaluate answer quality for complex queries."""
+    try:
+        t0 = time.perf_counter()
+        prompt = (f"Question: {question}\nContext: {context[:5000]}\nAnswer: {answer}\n"
+                  f"Evaluate this answer. Return JSON with 'answered_question': bool, "
+                  f"'missing_info': str|null, 'contradictions': str|null, 'clarity': int 1-10.")
+        raw = chat([{"role": "system", "content": "You are an evaluation bot."},
+                    {"role": "user", "content": prompt}], 
+                   model=config.FAST_MODEL, json_mode=True, max_tokens=200)
+        eval_res = _parse_json(raw)
+        eval_res["question"] = question
+        eval_res["latency_s"] = round(time.perf_counter() - t0, 3)
+        eval_res["timestamp"] = time.time()
+        
+        log_file = config.DATA_DIR / "metrics" / "reasoning_evals.jsonl"
+        log_file.parent.mkdir(parents=True, exist_ok=True)
+        with open(log_file, "a", encoding="utf-8") as f:
+            f.write(json.dumps(eval_res, ensure_ascii=False) + "\n")
+    except Exception as e:
+        print(f"[async_validator] failed: {e}", file=sys.stderr)
+
+
+
+def lookup_cutoff(college_id: str, exam: str, year: int, category: str = "GENERAL") -> dict | None:
+    from .store.backend import get_backend
+    rows = get_backend().q("""
+        SELECT year, round, opening_rank, closing_rank
+        FROM cutoff
+        WHERE college_id = %s AND exam = %s AND category = %s AND year = %s
+        ORDER BY round DESC LIMIT 5
+    """, [college_id, exam, category, year])
+    return [dict(r) for r in rows] if rows else None
+

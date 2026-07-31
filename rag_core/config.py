@@ -64,10 +64,30 @@ CACHE_ENABLED = os.getenv("MME_CACHE", "0") == "1"
 # happened to fit in the window.
 TOP_K = int(os.getenv("TOP_K", "12"))
 
+# Adaptive top-k: override the default per question_kind. Lookups waste context
+# on 11 irrelevant cards; enumerations truncate meaningful results. The router
+# already classifies question_kind — use it.
+ADAPTIVE_TOP_K = {
+    "lookup":        int(os.getenv("TOP_K_LOOKUP", "5")),
+    "profile_share": 0,  # no retrieval needed — student is sharing facts, not asking
+    "enumerate":     int(os.getenv("TOP_K_ENUMERATE", "15")),
+    "recommend":     int(os.getenv("TOP_K_RECOMMEND", "12")),
+    "other":         TOP_K,
+}
+
+# Cited colleges per answer (citations[]). Capping here keeps the page a
+# student reads from getting out of hand; the same cap also constrains the
+# hydration in app.py so the two are aligned.
+MAX_CITED_COLLEGES = int(os.getenv("MIVI_MAX_CITED_COLLEGES", "12"))
+
 # Hard ceiling on the characters of college cards handed to the generator. A
 # runaway context is both a cost and a quality problem: past ~12k the model
 # starts losing the middle of the list.
-MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", "12000"))
+#
+# Derived from MAX_CITED_COLLEGES * ~1000 chars/card, with the override still
+# honoured so an operator can decouple them when a card set is known to be
+# unusually verbose (or terse).
+MAX_CONTEXT_CHARS = int(os.getenv("MAX_CONTEXT_CHARS", str(MAX_CITED_COLLEGES * 1000)))
 
 # Overseas institutions quote fees in their own currency (verified: domestic
 # courses carry a rupee symbol, abroad carry dollars). Mixing them into a
@@ -78,3 +98,20 @@ INCLUDE_ABROAD_DEFAULT = os.getenv("INCLUDE_ABROAD", "0") == "1"
 # Public college page on the live site — a citation id IS the URL slug, which
 # is what lets the chat UI link every claim back to a real page.
 COLLEGE_URL = "https://makemyeducation.com/college/{college_id}"
+
+
+EMBED_MODEL_OPTIONS = {
+    "e5-small": "intfloat/multilingual-e5-small",       # current, 384 dim
+    "e5-base": "intfloat/multilingual-e5-base",          # 768 dim, better quality
+    "e5-large": "intfloat/multilingual-e5-large",        # 1024 dim, best e5
+    "bge-m3": "BAAI/bge-m3",                            # 1024 dim, best multilingual
+    "mpnet": "sentence-transformers/paraphrase-multilingual-mpnet-base-v2",  # 768 dim
+    "cohere": "embed-multilingual-v3",                   # API, 1024 dim
+}
+
+EMBED_MODEL = os.getenv("EMBED_MODEL", "intfloat/multilingual-e5-small")
+EMBED_DIM = int(os.getenv("EMBED_DIM", "384"))
+
+RERANK_ENABLED = os.getenv("MIVI_RERANK", "1") == "1"
+RERANK_CONFIDENCE_THRESHOLD = float(os.getenv("MIVI_RERANK_THRESHOLD", "0.01"))
+

@@ -91,50 +91,81 @@ def _compose_query(question, prefs, calls):
     return " ".join([question] + [p.split(": ", 1)[-1] for p in parts] + ["India college"])[:200]
 
 
+def _search_firecrawl(query: str, key: str) -> list[dict] | None:
+    for attempt in range(2):
+        try:
+            resp = requests.post(
+                FIRECRAWL_SEARCH,
+                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
+                json={"query": query, "limit": 4},
+                timeout=30,
+            )
+            resp.raise_for_status()
+            data = resp.json().get("data", [])
+            results = data.get("web", []) if isinstance(data, dict) else data
+            sources = []
+            for item in results or []:
+                url = item.get("url")
+                title = (item.get("title") or "").strip()
+                snippet = (item.get("description") or item.get("markdown") or "").strip()
+                if url and (title or snippet):
+                    sources.append({"url": url, "text": f"{title}\n{snippet[:600]}"})
+                if len(sources) >= 4:
+                    break
+            return sources
+        except Exception as e:
+            import sys
+            print(f"[webmode] firecrawl error (attempt {attempt + 1}): {e}", file=sys.stderr)
+            import time
+            if attempt == 0:
+                time.sleep(2)
+    return None
+
+def _search_tavily(query: str, key: str) -> list[dict] | None:
+    try:
+        resp = requests.post(
+            "https://api.tavily.com/search",
+            headers={"Content-Type": "application/json"},
+            json={"api_key": key, "query": query, "search_depth": "basic", "max_results": 4},
+            timeout=30,
+        )
+        resp.raise_for_status()
+        results = resp.json().get("results", [])
+        sources = []
+        for item in results:
+            if item.get("url") and (item.get("title") or item.get("content")):
+                sources.append({"url": item["url"], "text": f"{item.get('title')}\n{item.get('content', '')[:600]}"})
+        return sources
+    except Exception as e:
+        import sys
+        print(f"[webmode] tavily error: {e}", file=sys.stderr)
+        return None
+
 def web_answer(question, prefs=None):
+    import time
+    import sys
     t_start = time.perf_counter()
-    key = os.getenv("FIRECRAWL_API_KEY", "")
-    if not key:
-        return {"answer": "Web mode is not configured (set FIRECRAWL_API_KEY in .env).",
+    fc_key = os.getenv("FIRECRAWL_API_KEY", "")
+    tav_key = os.getenv("TAVILY_API_KEY", "")
+    if not fc_key and not tav_key:
+        return {"answer": "Web mode is not configured (set FIRECRAWL_API_KEY or TAVILY_API_KEY in .env).",
                 "citations": [], "answered": False,
-                "reason_if_unanswered": "FIRECRAWL_API_KEY missing."}
+                "reason_if_unanswered": "API keys missing."}
 
     calls = []
     search_query = _compose_query(question, prefs, calls)
     print(f"[webmode] search query: {search_query!r}", file=sys.stderr)
 
-    data = None
-    for attempt in range(2):  # one transparent retry on transient failures
-        try:
-            resp = requests.post(
-                FIRECRAWL_SEARCH,
-                headers={"Authorization": f"Bearer {key}", "Content-Type": "application/json"},
-                json={"query": search_query, "limit": 4},  # snippets only — no scraping
-                timeout=30,
-            )
-            resp.raise_for_status()
-            data = resp.json().get("data", [])
-            break
-        except Exception as e:
-            print(f"[webmode] firecrawl error (attempt {attempt + 1}): {e}", file=sys.stderr)
-            if attempt == 0:
-                time.sleep(2)
-    if data is None:
+    sources = None
+    if fc_key:
+        sources = _search_firecrawl(search_query, fc_key)
+    if sources is None and tav_key:
+        sources = _search_tavily(search_query, tav_key)
+        
+    if sources is None:
         return {"answer": "Web search failed — please try again in a moment.",
                 "citations": [], "answered": False,
-                "reason_if_unanswered": "Firecrawl request failed after retry."}
-
-    # v2 nests results under data.web; v1 returned a flat list. Accept both.
-    results = data.get("web", []) if isinstance(data, dict) else data
-    sources = []
-    for item in results or []:
-        url = item.get("url")
-        title = (item.get("title") or "").strip()
-        snippet = (item.get("description") or item.get("markdown") or "").strip()
-        if url and (title or snippet):
-            sources.append({"url": url, "text": f"{title}\n{snippet[:600]}"})
-        if len(sources) >= 4:
-            break
+                "reason_if_unanswered": "All search providers failed."}
 
     if not sources:
         return {"answer": "The web search returned no usable results for this question.",

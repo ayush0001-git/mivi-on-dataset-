@@ -76,6 +76,7 @@ NIRF_BASE = "https://www.nirfindia.org"
 NIRF_CATEGORIES = (
     "Overall", "University", "Engineering", "Management", "Pharmacy",
     "Medical", "Law", "College", "Architecture", "Research",
+    "Dental", "Agriculture",
 )
 
 # Matching thresholds. Deliberately strict — see the module docstring on why a
@@ -675,3 +676,11 @@ def main() -> None:
 
 if __name__ == "__main__":
     main()
+
+def should_run_nirf(backend, current_year: int) -> bool:
+    last_run = backend.one(
+        "SELECT MAX(fetched_at) FROM registry_fact WHERE registry = 'nirf'"
+    )
+    if not last_run:
+        return True
+    return False

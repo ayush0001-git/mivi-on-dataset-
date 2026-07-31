@@ -106,3 +106,64 @@ def chat(messages, model, json_mode=False, temperature=0.2, max_tokens=800, usag
             print(f"[llm] failing over to backup provider ({str(last_err)[:160]})",
                   file=sys.stderr)
     raise last_err if last_err is not None else RuntimeError("LLM call failed")
+
+import sys, time, asyncio
+from openai import AsyncOpenAI
+
+_clients_async = {}
+
+def _async_client(base_url, api_key):
+    key = (base_url, api_key)
+    if key not in _clients_async:
+        from . import config
+        _clients_async[key] = AsyncOpenAI(
+            base_url=base_url, api_key=api_key,
+            timeout=config.LLM_TIMEOUT, max_retries=0
+        )
+    return _clients_async[key]
+
+async def achat(messages, model, json_mode=False, temperature=0.2, max_tokens=800, usage_log=None):
+    """Async version of chat(). Same provider failover."""
+    from . import config
+    providers = _providers(model)
+    last_err = None
+    for p_idx, (client, p_model, prefix) in enumerate(providers):
+        msgs = messages
+        if prefix:
+            msgs = [{'role': 'system', 'content': prefix}] + [m for m in messages if m.get('role') != 'system']
+        kwargs = dict(model=p_model, messages=msgs, temperature=temperature, max_tokens=max_tokens)
+        if json_mode:
+            kwargs['response_format'] = {'type': 'json_object'}
+        
+        attempts, max_attempts = 0, (2 if len(providers) > 1 else 4)
+        while attempts < max_attempts:
+            t0 = time.perf_counter()
+            try:
+                aclient = _async_client(client.base_url, client.api_key)
+                resp = await aclient.chat.completions.create(**kwargs)
+                latency = time.perf_counter() - t0
+                if usage_log is not None and resp.usage:
+                    usage_log.append({
+                        'model': p_model,
+                        'input_tokens': resp.usage.prompt_tokens,
+                        'output_tokens': resp.usage.completion_tokens,
+                        'latency_s': round(latency, 3)
+                    })
+                return resp.choices[0].message.content or ''
+            except Exception as e:
+                msg = str(e).lower()
+                if 'response_format' in kwargs and ('response_format' in msg or 'json_object' in msg):
+                    kwargs.pop('response_format', None)
+                    continue
+                last_err = e
+                attempts += 1
+                rate_limited = ('429' in msg or 'rate' in msg or 'quota' in msg or 'exhausted' in msg)
+                timed_out = 'timeout' in msg or 'timed out' in msg
+                if (rate_limited or timed_out) and p_idx < len(providers) - 1:
+                    break
+                if attempts < max_attempts:
+                    await asyncio.sleep(min((3 if rate_limited else 1) * attempts, 8))
+        if p_idx < len(providers) - 1:
+            print(f'[llm] failing over to backup ({str(last_err)[:160]})', file=sys.stderr)
+    raise last_err if last_err is not None else RuntimeError('LLM call failed')
+

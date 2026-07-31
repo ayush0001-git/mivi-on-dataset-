@@ -56,19 +56,13 @@ def _q_to_pct(sql: str) -> str:
 
 
 class Row(dict):
-    """A dict row that also answers `row[0]`.
-
-    Everything in rag_core reads columns by name, but callers outside it
-    (app.py's health probe) still index the first column positionally, the way
-    sqlite3.Row allowed. Honouring both shapes costs one method here and saves
-    editing modules this migration does not own.
+    """A dict row. Everything in rag_core reads columns by name; the old
+    positional-index path (sqlite3.Row's `row[0]`) was carried over from the
+    SQLite era and removed: every legacy caller has been migrated, and
+    silently returning `list(values())[i]` for an integer key was a memory-
+    order trap on duplicate column names.
     """
     __slots__ = ()
-
-    def __getitem__(self, key):
-        if isinstance(key, int):
-            return list(self.values())[key]
-        return super().__getitem__(key)
 
 
 def _row_factory(cursor):
@@ -312,6 +306,27 @@ def get_backend() -> PostgresBackend:
         print(f"[store] backend=postgres ({_dsn_label(pool_owner.dsn)})",
               file=sys.stderr)
         _backend = pool_owner
+        # Bump SCHEMA_VERSION in lockstep with migration scripts. A wrong
+        # version is a soft warning: the corpus may still work, but the
+        # server has no way to know which queries are safe. The schema
+        # table itself is absent before the first ETL run, which is
+        # reported as "not initialised yet" rather than a mismatch.
+        try:
+            v = pool_owner.one(
+                "SELECT value FROM build_meta WHERE key = 'schema_version'")
+            expected = "2.0"
+            if v is None:
+                print("[store] build_meta has no schema_version — "
+                      "ETL has not yet recorded one (first build?)", file=sys.stderr)
+            elif str(v) != expected:
+                print(f"[store] WARNING: schema_version is {v!r}, expected "
+                      f"{expected!r}. Run: python -m rag_core.store.migrate_postgres",
+                      file=sys.stderr)
+            else:
+                print(f"[store] schema_version OK ({v})", file=sys.stderr)
+        except Exception as exc:  # noqa: BLE001 - advisory only
+            print(f"[store] schema_version check skipped: {str(exc)[:80]}",
+                  file=sys.stderr)
         return _backend
 
 

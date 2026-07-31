@@ -352,6 +352,11 @@ def live_run(cases: list[dict], sleep_s: float, report_path: Path | None) -> int
 
     stats: dict[str, list[int]] = {}
     records = []
+    
+    eval_mrr_sum = 0.0
+    eval_recall10_sum = 0.0
+    eval_retrieval_cases = 0
+    
     for i, case in enumerate(cases):
         if i and sleep_s:
             time.sleep(sleep_s)  # stay inside provider rate limits
@@ -384,6 +389,17 @@ def live_run(cases: list[dict], sleep_s: float, report_path: Path | None) -> int
                         "answered": result.get("answered"),
                         "citations": result.get("citations"),
                         "answer": result.get("answer")})
+        
+        grounded = [g["college_id"] for g in case.get("grounded") or []]
+        if grounded:
+            retrieved_ids = result.get("retrieved_ids", [])
+            target = grounded[0]
+            if target in retrieved_ids:
+                rank = retrieved_ids.index(target) + 1
+                eval_mrr_sum += 1.0 / rank
+                if rank <= 10:
+                    eval_recall10_sum += 1.0
+            eval_retrieval_cases += 1
 
     print(f"\n{'kind':<18}{'pass':>6}{'total':>7}{'rate':>8}")
     print("-" * 39)
@@ -412,6 +428,11 @@ def live_run(cases: list[dict], sleep_s: float, report_path: Path | None) -> int
     if answer_want:
         print(f"  answered when it should:     {answer_got}/{answer_want} "
               f"({answer_want - answer_got} false refusals)")
+
+    if eval_retrieval_cases > 0:
+        print("\nretrieval")
+        print(f"  Recall@10:                   {eval_recall10_sum / eval_retrieval_cases:>7.1%}")
+        print(f"  MRR:                         {eval_mrr_sum / eval_retrieval_cases:>7.3f}")
 
     if report_path:
         report_path.write_text(json.dumps(records, ensure_ascii=False, indent=1),
